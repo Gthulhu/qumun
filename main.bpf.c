@@ -70,11 +70,6 @@ u64 usersched_last_run_at; /* Timestamp of the last user-space scheduler executi
 static u64 nr_cpu_ids; /* Maximum possible CPU number */
 
 /*
- * Switch all tasks or SCHED_EXT tasks.
- */
-const volatile bool switch_partial;
-
-/*
  * Number of tasks that are queued for scheduling.
  *
  * This number is incremented by the BPF component when a task is queued to the
@@ -159,7 +154,7 @@ static int calloc_cpumask(struct bpf_cpumask **p_cpumask)
 /*
  * The map containing tasks that are queued to user space from the kernel.
  *
- * This map is drained by the user space scheduler.
+ * This map is drained by the user-space scheduler.
  */
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -902,7 +897,7 @@ void BPF_STRUCT_OPS(goland_enqueue, struct task_struct *p, u64 enq_flags)
 
 	/*
 	 * WORKAROUND: Dispatch user-space scheduler to the shared DSQ to avoid
-	 * starvation on user space scheduler goroutine(s).
+	 * starvation on user-space scheduler goroutine(s).
 	 */
 	if (is_belong_usersched_task(p)) {
 		scx_bpf_dsq_insert(p, SCHED_DSQ, SCX_SLICE_INF, SCX_ENQ_HEAD);
