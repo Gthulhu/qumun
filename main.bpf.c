@@ -896,7 +896,7 @@ static void queue_task_to_userspace(struct task_struct *p, u64 enq_flags)
 	if (!task) {
 		sched_congested(p);
 		scx_bpf_dsq_insert_vtime(p, SHARED_DSQ,
-					 default_slice, p->scx.dsq_vtime, enq_flags);
+					 SCX_SLICE_DFL, p->scx.dsq_vtime, enq_flags);
 		__sync_fetch_and_add(&nr_kernel_dispatches, 1);
 		return;
 	}
@@ -1044,7 +1044,7 @@ void BPF_STRUCT_OPS(goland_enqueue, struct task_struct *p, u64 enq_flags)
 		 * Directly dispatch the task to selected idle CPU (queued wakeup).
 		 */
 		scx_bpf_dsq_insert_vtime(p, cpu_to_dsq(cpu),
-					 default_slice, p->scx.dsq_vtime, enq_flags);
+					 SCX_SLICE_DFL, p->scx.dsq_vtime, enq_flags);
 		__sync_fetch_and_add(&nr_kernel_dispatches, 1);
 		goto out_kick;
 	}
