@@ -844,12 +844,12 @@ int rs_select_cpu(struct task_cpu_arg *input)
  * scheduler.
  */
 static void get_task_info(struct queued_task_ctx *task,
-			  const struct task_struct *p, u64 enq_flags)
+			  const struct task_struct *p, s32 prev_cpu, u64 enq_flags)
 {
 	struct task_ctx *tctx = try_lookup_task_ctx(p);
 
 	task->pid = p->pid;
-	task->cpu = scx_bpf_task_cpu(p);
+	task->cpu = prev_cpu;
 	task->nr_cpus_allowed = p->nr_cpus_allowed;
 	task->flags = enq_flags;
 	task->start_ts = tctx ? tctx->start_ts : 0;
@@ -881,7 +881,7 @@ static bool is_queued_wakeup(const struct task_struct *p, u64 enq_flags)
 /*
  * Queue a task to the user-space scheduler.
  */
-static void queue_task_to_userspace(struct task_struct *p, u64 enq_flags)
+static void queue_task_to_userspace(struct task_struct *p, s32 prev_cpu, u64 enq_flags)
 {
 	struct queued_task_ctx *task;
 
@@ -906,7 +906,7 @@ static void queue_task_to_userspace(struct task_struct *p, u64 enq_flags)
 	 * will be consumed by the user-space scheduler.
 	 */
 	dbg_msg("enqueue: pid=%d (%s)", p->pid, p->comm);
-	get_task_info(task, p, enq_flags);
+	get_task_info(task, p, prev_cpu, enq_flags);
 	bpf_ringbuf_submit(task, 0);
 	__sync_fetch_and_add(&nr_queued, 1);
 }
@@ -1002,7 +1002,7 @@ void BPF_STRUCT_OPS(goland_enqueue, struct task_struct *p, u64 enq_flags)
 	 * queued to the user-space scheduler.
 	 */
 	if (!(builtin_idle && is_wakeup)) {
-		queue_task_to_userspace(p, enq_flags);
+		queue_task_to_userspace(p, prev_cpu, enq_flags);
 		goto out_kick;
 	}
 
@@ -1012,7 +1012,7 @@ void BPF_STRUCT_OPS(goland_enqueue, struct task_struct *p, u64 enq_flags)
 	 */
 	cpu = pick_idle_cpu(p, prev_cpu);
 	if (cpu < 0) {
-		queue_task_to_userspace(p, enq_flags);
+		queue_task_to_userspace(p, prev_cpu, enq_flags);
 		goto out_kick;
 	}
 
@@ -1052,7 +1052,7 @@ void BPF_STRUCT_OPS(goland_enqueue, struct task_struct *p, u64 enq_flags)
 	/*
 	 * If we can't directly dispatch, queue the task to user-space.
 	 */
-	queue_task_to_userspace(p, enq_flags);
+	queue_task_to_userspace(p, prev_cpu, enq_flags);
 
 out_kick:
 	/*
