@@ -100,7 +100,20 @@ func (s *Sched) AssignUserSchedPid(pid int) error {
 	return nil
 }
 
-// AssignKhugepagePid manually assigns the PID of the khugepaged process
+// AssignKhugepagePid manually assigns the PID of the khugepaged process.
+// This allows overriding the automatic khugepaged PID detection performed in AssignUserSchedPid.
+// Use this when you need to specify a custom khugepaged PID or when automatic detection fails.
+//
+// Example usage:
+//   err := bpfModule.AssignUserSchedPid(os.Getpid())
+//   if err != nil {
+//       log.Printf("AssignUserSchedPid failed: %v", err)
+//   }
+//   // Optionally override with a custom khugepaged PID
+//   err = bpfModule.AssignKhugepagePid(1234)
+//   if err != nil {
+//       log.Printf("AssignKhugepagePid failed: %v", err)
+//   }
 func (s *Sched) AssignKhugepagePid(pid int) error {
 	C.set_khugepaged_pid(C.u32(pid))
 	return nil
