@@ -48,7 +48,7 @@ u32 get_usersched_pid();
 
 void set_usersched_pid(u32 id);
 
-void set_kugepagepid(u32 id);
+void set_khugepaged_pid(u32 id);
 
 void set_debug(bool enabled);
 

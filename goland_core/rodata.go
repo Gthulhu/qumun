@@ -95,8 +95,14 @@ func (s *Sched) GetRoData() (Rodata, error) {
 }
 
 func (s *Sched) AssignUserSchedPid(pid int) error {
-	C.set_kugepagepid(C.u32(KhugepagePid()))
+	C.set_khugepaged_pid(C.u32(KhugepagePid()))
 	C.set_usersched_pid(C.u32(pid))
+	return nil
+}
+
+// AssignKhugepagePid manually assigns the PID of the khugepaged process
+func (s *Sched) AssignKhugepagePid(pid int) error {
+	C.set_khugepaged_pid(C.u32(pid))
 	return nil
 }
 
