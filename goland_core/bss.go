@@ -45,6 +45,10 @@ func GetUserSchedPid() int {
 	return int(C.get_usersched_pid())
 }
 
+func GetKhugepagePid() int {
+	return int(C.get_khugepaged_pid())
+}
+
 func GetNrQueued() uint64 {
 	return uint64(C.get_nr_queued())
 }

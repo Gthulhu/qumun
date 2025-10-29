@@ -46,6 +46,8 @@ void *open_skel();
 
 u32 get_usersched_pid();
 
+u32 get_khugepaged_pid();
+
 void set_usersched_pid(u32 id);
 
 void set_khugepaged_pid(u32 id);

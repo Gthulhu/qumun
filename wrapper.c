@@ -14,6 +14,10 @@ u32 get_usersched_pid() {
     return global_obj->rodata->usersched_pid;
 }
 
+u32 get_khugepaged_pid() {
+    return global_obj->rodata->khugepaged_pid;
+}
+
 void set_usersched_pid(u32 id) {
     global_obj->rodata->usersched_pid = id;
 }
