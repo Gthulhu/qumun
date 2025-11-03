@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"log"
 	"os"
 	"os/signal"
@@ -161,6 +162,7 @@ func main() {
 	}
 
 	log.Printf("UserSched's Pid: %v", core.GetUserSchedPid())
+	log.Printf("scheduler started")
 
 	go func() {
 		var t *models.QueuedTask
@@ -204,12 +206,27 @@ func main() {
 	signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM)
 	cont := true
 	timer := time.NewTicker(1 * time.Second)
+	notifyCount := 0
 	for cont {
 		select {
 		case <-signalChan:
 			log.Println("receive os signal")
 			cont = false
 		case <-timer.C:
+			notifyCount++
+			if notifyCount%10 == 0 {
+				bss, err := bpfModule.GetBssData()
+				if err != nil {
+					log.Println("GetBssData failed", "error", err)
+				} else {
+					b, err := json.Marshal(bss)
+					if err != nil {
+						log.Println("json.Marshal failed", "error", err)
+					} else {
+						log.Println("bss data", "data", string(b))
+					}
+				}
+			}
 			if bpfModule.Stopped() {
 				log.Println("bpfModule stopped")
 				uei, err := bpfModule.GetUeiData()
