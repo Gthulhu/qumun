@@ -171,11 +171,8 @@ func main() {
 		for true {
 			t = GetTaskFromPool()
 			if t == nil {
-				for uint64(taskPoolCount) < 10 {
-					if num := DrainQueuedTask(bpfModule); num == 0 {
-						bpfModule.BlockTilReadyForDequeue(context.TODO())
-					}
-				}
+				bpfModule.BlockTilReadyForDequeue(context.TODO())
+				DrainQueuedTask(bpfModule)
 			} else if t.Pid != -1 {
 				task = core.NewDispatchedTask(t)
 				err, cpu = bpfModule.SelectCPU(t)
