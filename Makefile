@@ -57,7 +57,9 @@ build: clean $(BPF_OBJ) libbpf libbpf-uapi wrapper
 	$(CGOFLAG) go build -ldflags "-w -s $(STATIC)" main.go
 
 test: build
-	vng -r v6.12.2 -- timeout 15 bash -c "./main" || true
+	@echo "Running scheduler test..."
+	@chmod +x scripts/test_scheduler.sh
+	@vng -r v6.12.2 -- bash scripts/test_scheduler.sh
 
 .PHONY: libbpf-uapi
 libbpf-uapi: $(LIBBPF_SRC)
