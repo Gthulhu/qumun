@@ -115,6 +115,8 @@ volatile u64 nr_user_dispatches, nr_kernel_dispatches,
 /* Failure statistics */
 volatile u64 nr_failed_dispatches, nr_sched_congested;
 
+volatile s32 pinned_cpu;
+
 /* Report additional debugging information */
 const volatile bool debug;
 
@@ -836,7 +838,6 @@ s32 BPF_STRUCT_OPS(goland_select_cpu, struct task_struct *p, s32 prev_cpu,
 	 * prioritize the waker's CPU.
 	 */
 	return is_wake_sync(wake_flags) ? bpf_get_smp_processor_id() : prev_cpu;
-
 }
 
 SEC("syscall")
@@ -1118,7 +1119,7 @@ void BPF_STRUCT_OPS(goland_dispatch, s32 cpu, struct task_struct *prev)
 	 * Dispatch the user-space scheduler if there's any pending action
 	 * to do. Keep consuming from SCHED_DSQ until it's empty.
 	 */
-	if (cpu == 0 && usersched_has_pending_tasks()) {
+	if (cpu == pinned_cpu && usersched_has_pending_tasks()) {
 		int consumed = 0;
 		while (scx_bpf_dsq_move_to_local(SCHED_DSQ) && consumed++ < MAX_USERSCHED_DISPATCH)
 			;
@@ -1318,11 +1319,11 @@ static int usersched_timer_fn(void *map, int *key, struct bpf_timer *timer)
 		p = bpf_task_from_pid(usersched_pid);
 		if (p) {
 			s32 cpu;
-
 			set_usersched_needed();
 			cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
 			if (cpu >= 0)
 				scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+				pinned_cpu = cpu;
 			bpf_task_release(p);
 		}
 		bpf_rcu_read_unlock();
