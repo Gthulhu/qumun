@@ -37,6 +37,18 @@
 #endif
 
 #include "intf.h"
+#include <bpf/bpf_helpers.h>
+
+/* Compatibility fallbacks for kernel flag macros that may not be defined
+ * in older build environments or trimmed header sets used during BPF
+ * compilation. Define them as 0 if missing so bitwise checks become no-op.
+ */
+#ifndef PF_KSWAPD
+#define PF_KSWAPD 0
+#endif
+#ifndef PF_KCOMPACTD
+#define PF_KCOMPACTD 0
+#endif
 
 char _license[] SEC("license") = "GPL";
 
@@ -60,6 +72,11 @@ UEI_DEFINE(uei);
  * time slices, the scheduler is invoked again, repeating the cycle.
  */
 #define SCHED_DSQ (MAX_CPUS + 1)
+
+/*
+ * Safety cap for dispatching usersched threads per invocation.
+ */
+#define MAX_USERSCHED_DISPATCH 64
 
 /*
  * Scheduler attributes and statistics.
@@ -396,6 +413,9 @@ static bool test_and_clear_usersched_needed(void)
  */
 static bool usersched_has_pending_tasks(void)
 {
+	if (test_and_clear_usersched_needed())
+		return true;
+
 	if (nr_scheduled)
 		return true;
 
@@ -794,8 +814,9 @@ s32 BPF_STRUCT_OPS(goland_select_cpu, struct task_struct *p, s32 prev_cpu,
 	 * Scheduler is dispatched directly in .dispatch() when needed, so
 	 * we can skip it here.
 	 */
-	if (is_usersched_task(p))
+	if (is_belong_usersched_task(p)) {
 		return prev_cpu;
+	}
 
 	cpu = try_direct_dispatch(p, prev_cpu, 0, &dispatched);
 	if (cpu >= 0)
@@ -922,20 +943,13 @@ void BPF_STRUCT_OPS(goland_enqueue, struct task_struct *p, u64 enq_flags)
 	bool is_wakeup = is_queued_wakeup(p, enq_flags);
 
 	/*
-	 * Scheduler is dispatched directly in .dispatch() when needed, so
-	 * we can skip it here.
-	 */
-	if (is_usersched_task(p))
-		return;
-
-	/*
-	 * WORKAROUND: Dispatch user-space scheduler to the shared DSQ to avoid
-	 * starvation on user-space scheduler goroutine(s).
+	 * Insert the user-space scheduler to its dedicated DSQ, it will be
+	 * consumed from ops.dispatch() only when there's any pending
+	 * scheduling action to do.
 	 */
 	if (is_belong_usersched_task(p)) {
-		scx_bpf_dsq_insert(p, SCHED_DSQ, SCX_SLICE_INF, SCX_ENQ_HEAD);
-		kick_task_cpu(p, prev_cpu);
-		return;
+		scx_bpf_dsq_insert(p, SCHED_DSQ, default_slice, enq_flags);
+		goto out_kick;
 	}
 
 	/*
@@ -1063,31 +1077,6 @@ out_kick:
 }
 
 /*
- * Dispatch the user-space scheduler.
- */
-static void dispatch_user_scheduler(void)
-{
-	struct task_struct *p;
-
-	p = bpf_task_from_pid(usersched_pid);
-	if (!p) {
-		scx_bpf_error("Failed to find usersched task %d", usersched_pid);
-		return;
-	}
-
-	/*
-	 * Assign an infinite time slice to the user-space scheduler, so
-	 * that it can completely drain all the pending tasks.
-	 *
-	 * The user-space scheduler will voluntarily yield the CPU upon
-	 * completion through BpfScheduler->notify_complete().
-	 */
-	scx_bpf_dsq_insert(p, SCHED_DSQ, default_slice, SCX_ENQ_HEAD);
-
-	bpf_task_release(p);
-}
-
-/*
  * Handle a task dispatched from user-space, performing the actual low-level
  * BPF dispatch.
  */
@@ -1117,11 +1106,15 @@ static long handle_dispatched_task(struct bpf_dynptr *dynptr, void *context)
 void BPF_STRUCT_OPS(goland_dispatch, s32 cpu, struct task_struct *prev)
 {
 	/*
-	 * Fire up the user-space scheduler: it will run only if no other
-	 * task needs to run.
+	 * Dispatch the user-space scheduler if there's any pending action
+	 * to do. Keep consuming from SCHED_DSQ until it's empty.
 	 */
-	if (test_and_clear_usersched_needed())
-		dispatch_user_scheduler();
+	if (usersched_has_pending_tasks()) {
+		int consumed = 0;
+		while (scx_bpf_dsq_move_to_local(SCHED_DSQ) && consumed++ < MAX_USERSCHED_DISPATCH)
+			;
+		return;
+	}
 
 	/*
 	 * Consume all tasks from the @dispatched list and immediately
@@ -1129,7 +1122,7 @@ void BPF_STRUCT_OPS(goland_dispatch, s32 cpu, struct task_struct *prev)
 	 * scheduler.
 	 */
 	s32 ret = bpf_user_ringbuf_drain(&dispatched,
-									 handle_dispatched_task, NULL, BPF_RB_NO_WAKEUP);
+				handle_dispatched_task, NULL, BPF_RB_NO_WAKEUP);
 	if (ret < 0)
 		dbg_msg("User ringbuf drain error: %d", ret);
 
@@ -1146,35 +1139,23 @@ void BPF_STRUCT_OPS(goland_dispatch, s32 cpu, struct task_struct *prev)
 		return;
 
 	/*
-	 * Lastly, consume and dispatch the user-space scheduler.
-	 */
-	if (scx_bpf_dsq_move_to_local(SCHED_DSQ))
-		return;
-
-	/*
-	 * If there are still pending task, notify the user-space scheduler
-	 * and prevent the CPU from going idle.
-	 */
-	if (usersched_has_pending_tasks()) {
-		set_usersched_needed();
-		scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
-		return;
-	}
-
-	/*
 	 * If the current task expired its time slice and no other task
 	 * wants to run, simply replenish its time slice and let it run for
 	 * another round on the same CPU.
+	 *
+	 * In case of the user-space scheduler task, replenish its time
+	 * slice only if there're still pending scheduling actions to do.
 	 */
-	if (prev && is_queued(prev) && !is_usersched_task(prev))
-		prev->scx.slice = SCX_SLICE_DFL;
+	if (prev && is_queued(prev) &&
+	    (!is_belong_usersched_task(prev) || usersched_has_pending_tasks()))
+		prev->scx.slice = default_slice;
 }
 
 void BPF_STRUCT_OPS(goland_runnable, struct task_struct *p, u64 enq_flags)
 {
 	struct task_ctx *tctx;
 
-	if (is_usersched_task(p))
+	if (is_belong_usersched_task(p))
 		return;
 
 	tctx = try_lookup_task_ctx(p);
@@ -1192,7 +1173,7 @@ void BPF_STRUCT_OPS(goland_running, struct task_struct *p)
 	s32 cpu = scx_bpf_task_cpu(p);
 	struct task_ctx *tctx;
 
-	if (is_usersched_task(p)) {
+	if (is_belong_usersched_task(p)) {
 		usersched_last_run_at = scx_bpf_now();
 		return;
 	}
@@ -1223,7 +1204,7 @@ void BPF_STRUCT_OPS(goland_stopping, struct task_struct *p, bool runnable)
 	s32 cpu = scx_bpf_task_cpu(p);
 	struct task_ctx *tctx;
 
-	if (is_usersched_task(p))
+	if (is_belong_usersched_task(p))
 		return;
 
 	dbg_msg("stop: pid=%d (%s) cpu=%ld", p->pid, p->comm, cpu);
@@ -1248,15 +1229,6 @@ void BPF_STRUCT_OPS(goland_stopping, struct task_struct *p, bool runnable)
 void BPF_STRUCT_OPS(goland_cpu_release, s32 cpu,
 				struct scx_cpu_release_args *args)
 {
-	struct task_struct *p = args->task;
-	/*
-	 * If the interrupted task is the user-space scheduler make sure to
-	 * re-schedule it immediately.
-	 */
-	dbg_msg("cpu preemption: pid=%d (%s)", p->pid, p->comm);
-	if (is_belong_usersched_task(p))
-		set_usersched_needed();
-
 	/*
 	 * A higher scheduler class stole the CPU, re-enqueue all the tasks
 	 * that are waiting on this CPU and give them a chance to pick
