@@ -808,7 +808,16 @@ s32 BPF_STRUCT_OPS(goland_select_cpu, struct task_struct *p, s32 prev_cpu,
 		   u64 wake_flags)
 {
 	bool dispatched = false;
-	s32 cpu;
+	s32 cpu, this_cpu = bpf_get_smp_processor_id();
+	bool is_this_cpu_allowed = bpf_cpumask_test_cpu(this_cpu, p->cpus_ptr);
+
+	/*
+	 * Make sure @prev_cpu is usable, otherwise try to move close to
+	 * the waker's CPU. If the waker's CPU is also not usable, then
+	 * pick the first usable CPU.
+	 */
+	if (!bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr))
+		prev_cpu = is_this_cpu_allowed ? this_cpu : bpf_cpumask_first(p->cpus_ptr);
 
 	/*
 	 * Scheduler is dispatched directly in .dispatch() when needed, so
@@ -1109,7 +1118,7 @@ void BPF_STRUCT_OPS(goland_dispatch, s32 cpu, struct task_struct *prev)
 	 * Dispatch the user-space scheduler if there's any pending action
 	 * to do. Keep consuming from SCHED_DSQ until it's empty.
 	 */
-	if (usersched_has_pending_tasks()) {
+	if (cpu == 0 && usersched_has_pending_tasks()) {
 		int consumed = 0;
 		while (scx_bpf_dsq_move_to_local(SCHED_DSQ) && consumed++ < MAX_USERSCHED_DISPATCH)
 			;
