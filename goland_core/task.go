@@ -4,8 +4,8 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
-	"log"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"unsafe"
@@ -14,15 +14,18 @@ import (
 )
 
 func (s *Sched) BlockTilReadyForDequeue(ctx context.Context) {
-	select {
-	case t, ok := <-s.queue:
-		if !ok {
+	for {
+		select {
+		case t, ok := <-s.queue:
+			if !ok {
+				runtime.Gosched()
+				continue
+			}
+			s.queue <- t
+			return
+		case <-ctx.Done():
 			return
 		}
-		s.queue <- t
-		return
-	case <-ctx.Done():
-		return
 	}
 }
 
@@ -50,7 +53,6 @@ func (s *Sched) DequeueTask(task *models.QueuedTask) {
 		err = s.SubNrQueued()
 		if err != nil {
 			task.Pid = -1
-			log.Printf("SubNrQueued err: %v", err)
 			return
 		}
 		return
@@ -87,6 +89,11 @@ func (s *Sched) DispatchTask(t *DispatchedTask) error {
 	}
 	s.dispatch <- fastEncode(t)
 	return nil
+}
+
+// DispatchTaskSync dispatches a task and waits for completion.
+func (s *Sched) DispatchTaskSync(t *DispatchedTask) error {
+	return s.urb.Submit(fastEncode(t))
 }
 
 func fastDecode(data []byte, task *models.QueuedTask) error {

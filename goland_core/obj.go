@@ -106,7 +106,7 @@ func (s *Sched) Start() {
 			if err != nil {
 				panic(err)
 			}
-			rb.Poll(50)
+			rb.Poll(10)
 		} else if m.Name() == "dispatched" {
 			s.dispatch = make(chan []byte, 4096)
 			s.urb, err = s.mod.InitUserRingBuf("dispatched", s.dispatch)

@@ -115,8 +115,6 @@ volatile u64 nr_user_dispatches, nr_kernel_dispatches,
 /* Failure statistics */
 volatile u64 nr_failed_dispatches, nr_sched_congested;
 
-volatile s32 pinned_cpu;
-
 /* Report additional debugging information */
 const volatile bool debug;
 
@@ -415,7 +413,7 @@ static bool test_and_clear_usersched_needed(void)
  */
 static bool usersched_has_pending_tasks(void)
 {
-	if (test_and_clear_usersched_needed())
+	if (usersched_needed)
 		return true;
 
 	if (nr_scheduled)
@@ -915,6 +913,7 @@ static bool is_queued_wakeup(const struct task_struct *p, u64 enq_flags)
 static void queue_task_to_userspace(struct task_struct *p, s32 prev_cpu, u64 enq_flags)
 {
 	struct queued_task_ctx *task;
+	s32 cpu;
 
 	/*
 	 * Allocate a new entry in the ring buffer.
@@ -958,8 +957,20 @@ void BPF_STRUCT_OPS(goland_enqueue, struct task_struct *p, u64 enq_flags)
 	 * scheduling action to do.
 	 */
 	if (is_belong_usersched_task(p)) {
+		if (usersched_has_pending_tasks()) {
+			/*
+			* Pick any other idle CPU that the task can use.
+			*/
+			cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
+			if (cpu > -1) {
+				scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu,
+				default_slice, SCX_ENQ_HEAD);
+				scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+				return;
+			}
+		}
 		scx_bpf_dsq_insert(p, SCHED_DSQ, default_slice, enq_flags);
-		goto out_kick;
+		return;
 	}
 
 	/*
@@ -1016,6 +1027,8 @@ void BPF_STRUCT_OPS(goland_enqueue, struct task_struct *p, u64 enq_flags)
 			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | prio_cpu,
 				slice, prio_enq_flags);
 			__sync_fetch_and_add(&nr_user_dispatches, 1);
+			scx_bpf_kick_cpu(prio_cpu, SCX_KICK_IDLE);
+			return;
 		}
 	}
 
@@ -1119,7 +1132,7 @@ void BPF_STRUCT_OPS(goland_dispatch, s32 cpu, struct task_struct *prev)
 	 * Dispatch the user-space scheduler if there's any pending action
 	 * to do. Keep consuming from SCHED_DSQ until it's empty.
 	 */
-	if (cpu == pinned_cpu && usersched_has_pending_tasks()) {
+	if (usersched_has_pending_tasks()) {
 		int consumed = 0;
 		while (scx_bpf_dsq_move_to_local(SCHED_DSQ) && consumed++ < MAX_USERSCHED_DISPATCH)
 			;
@@ -1183,7 +1196,7 @@ void BPF_STRUCT_OPS(goland_running, struct task_struct *p)
 	s32 cpu = scx_bpf_task_cpu(p);
 	struct task_ctx *tctx;
 
-	if (is_belong_usersched_task(p)) {
+	if (is_usersched_task(p)) {
 		usersched_last_run_at = scx_bpf_now();
 		return;
 	}
@@ -1214,8 +1227,12 @@ void BPF_STRUCT_OPS(goland_stopping, struct task_struct *p, bool runnable)
 	s32 cpu = scx_bpf_task_cpu(p);
 	struct task_ctx *tctx;
 
-	if (is_belong_usersched_task(p))
+	if (is_belong_usersched_task(p)) {
+		if (nr_scheduled + nr_queued == 0) {
+			test_and_clear_usersched_needed();
+		}
 		return;
+	}
 
 	dbg_msg("stop: pid=%d (%s) cpu=%ld", p->pid, p->comm, cpu);
 
@@ -1230,21 +1247,6 @@ void BPF_STRUCT_OPS(goland_stopping, struct task_struct *p, bool runnable)
 	 * Update the partial execution time since last sleep.
 	 */
 	tctx->exec_runtime += now - tctx->start_ts;
-}
-
-/*
- * A CPU is taken away from the scheduler, preempting the current task by
- * another one running in a higher priority sched_class.
- */
-void BPF_STRUCT_OPS(goland_cpu_release, s32 cpu,
-				struct scx_cpu_release_args *args)
-{
-	/*
-	 * A higher scheduler class stole the CPU, re-enqueue all the tasks
-	 * that are waiting on this CPU and give them a chance to pick
-	 * another idle CPU.
-	 */
-	scx_bpf_reenqueue_local();
 }
 
 /*
@@ -1318,12 +1320,8 @@ static int usersched_timer_fn(void *map, int *key, struct bpf_timer *timer)
 		bpf_rcu_read_lock();
 		p = bpf_task_from_pid(usersched_pid);
 		if (p) {
-			s32 cpu;
 			set_usersched_needed();
-			cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
-			if (cpu >= 0)
-				scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
-				pinned_cpu = cpu;
+			scx_bpf_kick_cpu(scx_bpf_task_cpu(p), SCX_KICK_IDLE);
 			bpf_task_release(p);
 		}
 		bpf_rcu_read_unlock();
@@ -1528,16 +1526,65 @@ void BPF_STRUCT_OPS(goland_exit, struct scx_exit_info *ei)
 }
 
 /*
+ * A CPU is about to change its idle state. If the CPU is going idle, ensure
+ * that the user-space scheduler has a chance to run if there is any remaining
+ * work to do.
+ */
+void BPF_STRUCT_OPS(goland_update_idle, s32 cpu, bool idle)
+{
+	/*
+	 * Don't do anything if we exit from and idle state, a CPU owner will
+	 * be assigned in .running().
+	 */
+	if (!idle)
+		return;
+	/*
+	 * A CPU is now available, notify the user-space scheduler that tasks
+	 * can be dispatched, if there is at least one task waiting to be
+	 * scheduled, either queued (accounted in nr_queued) or scheduled
+	 * (accounted in nr_scheduled).
+	 *
+	 * NOTE: nr_queued is incremented by the BPF component, more exactly in
+	 * enqueue(), when a task is sent to the user-space scheduler, then
+	 * the scheduler drains the queued tasks (updating nr_queued) and adds
+	 * them to its internal data structures / state; at this point tasks
+	 * become "scheduled" and the user-space scheduler will take care of
+	 * updating nr_scheduled accordingly; lastly tasks will be dispatched
+	 * and the user-space scheduler will update nr_scheduled again.
+	 *
+	 * Checking both counters allows to determine if there is still some
+	 * pending work to do for the scheduler: new tasks have been queued
+	 * since last check, or there are still tasks "queued" or "scheduled"
+	 * since the previous user-space scheduler run. If the counters are
+	 * both zero it is pointless to wake-up the scheduler (even if a CPU
+	 * becomes idle), because there is nothing to do.
+	 *
+	 * Keep in mind that update_idle() doesn't run concurrently with the
+	 * user-space scheduler (that is single-threaded): this function is
+	 * naturally serialized with the user-space scheduler code, therefore
+	 * this check here is also safe from a concurrency perspective.
+	 */
+	if (nr_queued || nr_scheduled) {
+		/*
+		 * Kick the CPU to make it immediately ready to accept
+		 * dispatched tasks.
+		 */
+		set_usersched_needed();
+		scx_bpf_kick_cpu(cpu, 0);
+	}
+}
+
+/*
  * Scheduling class declaration.
  */
 SCX_OPS_DEFINE(goland,
 	       .select_cpu		= (void *)goland_select_cpu,
 	       .enqueue			= (void *)goland_enqueue,
 	       .dispatch		= (void *)goland_dispatch,
+		   .update_idle		= (void *)goland_update_idle,
 	       .runnable		= (void *)goland_runnable,
 	       .running			= (void *)goland_running,
 	       .stopping		= (void *)goland_stopping,
-	       .cpu_release		= (void *)goland_cpu_release,
 	       .enable			= (void *)goland_enable,
 	       .init_task		= (void *)goland_init_task,
 	       .exit_task		= (void *)goland_exit_task,
@@ -1545,4 +1592,6 @@ SCX_OPS_DEFINE(goland,
 	       .exit			= (void *)goland_exit,
 	       .timeout_ms		= 5000,
 	       .dispatch_max_batch	= MAX_DISPATCH_SLOT,
+		   .flags			= SCX_OPS_ENQ_LAST |
+					  SCX_OPS_KEEP_BUILTIN_IDLE,
 	       .name			= "goland");
