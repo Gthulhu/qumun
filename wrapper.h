@@ -66,6 +66,8 @@ void notify_complete(u64 nr_pending);
 
 void sub_nr_queued();
 
+void dec_nr_queued(u64 num);
+
 void destroy_skel(void *);
 
 void set_scx_enums(

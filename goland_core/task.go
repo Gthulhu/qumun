@@ -50,11 +50,6 @@ func (s *Sched) DequeueTask(task *models.QueuedTask) {
 			task.Pid = -1
 			return
 		}
-		err = s.SubNrQueued()
-		if err != nil {
-			task.Pid = -1
-			return
-		}
 		return
 	default:
 		task.Pid = -1

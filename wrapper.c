@@ -56,6 +56,12 @@ void sub_nr_queued() {
     }
 }
 
+void dec_nr_queued(u64 num) {
+    if (global_obj->bss->nr_queued){
+        global_obj->bss->nr_queued-=num;
+    }
+}
+
 void destroy_skel(void*skel) {
     main_bpf__destroy(skel);
 }

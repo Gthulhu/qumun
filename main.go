@@ -35,6 +35,7 @@ func DrainQueuedTask(s *core.Sched) int {
 		var newQueuedTask models.QueuedTask
 		s.DequeueTask(&newQueuedTask)
 		if newQueuedTask.Pid == -1 {
+			s.DecNrQueued(count)
 			return count
 		}
 		deadline := updatedEnqueueTask(s, &newQueuedTask)
@@ -155,6 +156,11 @@ func main() {
 	err = util.InitCacheDomains(bpfModule)
 	if err != nil {
 		log.Panicf("InitCacheDomains failed: %v", err)
+	}
+
+	err = util.ImportScxEnums()
+	if err != nil {
+		log.Panicf("ImportScxEnums failed: %v", err)
 	}
 
 	if err := bpfModule.Attach(); err != nil {
