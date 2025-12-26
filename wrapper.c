@@ -1,3 +1,8 @@
+// SPDX-FileCopyrightText: 2025 Gthulhu Team
+//
+// SPDX-License-Identifier: Apache-2.0
+// Author: Ian Chen <ychen.desl@gmail.com>
+
 #include "wrapper.h"
 
 struct main_bpf *global_obj;

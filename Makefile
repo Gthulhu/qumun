@@ -37,7 +37,7 @@ LIBBPF_OBJDIR = $(abspath ./$(OUTPUT)/libbpf)
 LIBBPF_DESTDIR = $(abspath ./$(OUTPUT))
 
 
-TARGET = main
+TARGET = ebpf/main
 BPF_TARGET = ${TARGET:=.bpf}
 BPF_C = ${BPF_TARGET:=.c}
 BPF_OBJ = ${BPF_C:.c=.o}
@@ -85,7 +85,7 @@ dep:
 	cd - && \
 	git clone -b feat/skel https://github.com/Gthulhu/libbpfgo.git
 
-$(BPF_OBJ): %.o: %.c
+$(BPF_OBJ): ebpf/%.o:ebpf/%.c
 	clang-17 \
 		-O2 -g -Wall -target bpf \
 		$(ARCH_DEFINE) $(ARCH_CPU_FLAGS) -mlittle-endian \
@@ -96,7 +96,7 @@ $(BPF_OBJ): %.o: %.c
 
 wrapper:
 	bpftool gen skeleton main.bpf.o > main.skeleton.h
-	$(CGO_CC) -g -O2 -Wall -fPIC -I scx/build/libbpf/src/usr/include -I scx/build/libbpf/include/uapi -I scx/scheds/include $(ARCH_SCHED_INCLUDE) -I scx/scheds/include/bpf-compat -I scx/scheds/include/lib -c wrapper.c -o wrapper.o
+	$(CGO_CC) -g -O2 -Wall -fPIC -c wrapper.c -o wrapper.o
 	ar rcs libwrapper.a wrapper.o
 
 clean:
