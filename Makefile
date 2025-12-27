@@ -95,7 +95,7 @@ $(BPF_OBJ): ebpf/%.o:ebpf/%.c
 		-c $< -o $@
 
 wrapper:
-	bpftool gen skeleton main.bpf.o > main.skeleton.h
+	bpftool gen skeleton ebpf/main.bpf.o > main.skeleton.h
 	$(CGO_CC) -g -O2 -Wall -fPIC -c wrapper.c -o wrapper.o
 	ar rcs libwrapper.a wrapper.o
 
