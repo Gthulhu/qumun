@@ -116,7 +116,7 @@ stress-ng -c 20 --timeout 20s --metrics-brief
 
 ## License
 
-This software is distributed under the terms of the GNU General Public License version 2.
+This software is distributed under the terms of the Apache License 2.0.
 
 ## Contributing
 
