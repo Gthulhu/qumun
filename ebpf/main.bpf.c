@@ -1132,6 +1132,7 @@ static void enqueue_task_kernel_mode(struct task_struct *p, u64 enq_flags)
 	 * Check if the task is in priority_tasks map and dispatch with preemption.
 	 */
 	u64 *prio_elem;
+	u64 *running_prio_elem;
 	u64 prio_slice;
 	u32 pid = p->pid;
 	s32 prio_cpu = -EBUSY;
@@ -1150,12 +1151,12 @@ static void enqueue_task_kernel_mode(struct task_struct *p, u64 enq_flags)
 			cur_pid_val = bpf_map_lookup_elem(&running_task, &prio_cpu);
 			if (cur_pid_val) {
 				cur_pid = *cur_pid_val;
-				prio_elem = bpf_map_lookup_elem(&priority_tasks, &cur_pid);
+				running_prio_elem = bpf_map_lookup_elem(&priority_tasks, &cur_pid);
 				/*
 				 * If current running task is prioritized, do not preempt it (use SCX_ENQ_HEAD).
 				 * Otherwise, keep the flag equals to SCX_ENQ_PREEMPT.
 				 */
-				if (prio_elem) {
+				if (running_prio_elem) {
 					prio_enq_flags = SCX_ENQ_HEAD;
 				}
 			}
