@@ -1128,6 +1128,46 @@ static void enqueue_task_kernel_mode(struct task_struct *p, u64 enq_flags)
 	}
 
 	/*
+	 * Handle priority tasks with custom dispatch logic (similar to user-space mode).
+	 * Check if the task is in priority_tasks map and dispatch with preemption.
+	 */
+	u64 *prio_elem;
+	u64 prio_slice;
+	u32 pid = p->pid;
+	s32 prio_cpu = -EBUSY;
+	u64 prio_enq_flags = SCX_ENQ_PREEMPT;
+	u32 *cur_pid_val;
+	u32 cur_pid;
+
+	prio_elem = bpf_map_lookup_elem(&priority_tasks, &pid);
+	if (prio_elem) {
+		prio_cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
+		if (prio_cpu == -EBUSY) {
+			prio_cpu = prev_cpu;
+		}
+		prio_slice = *prio_elem;
+		if (prio_cpu >= 0) {
+			cur_pid_val = bpf_map_lookup_elem(&running_task, &prio_cpu);
+			if (cur_pid_val) {
+				cur_pid = *cur_pid_val;
+				prio_elem = bpf_map_lookup_elem(&priority_tasks, &cur_pid);
+				/*
+				 * If current running task is prioritized, do not preempt it (use SCX_ENQ_HEAD).
+				 * Otherwise, keep the flag equals to SCX_ENQ_PREEMPT.
+				 */
+				if (prio_elem) {
+					prio_enq_flags = SCX_ENQ_HEAD;
+				}
+			}
+			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | prio_cpu,
+				prio_slice, prio_enq_flags);
+			__sync_fetch_and_add(&nr_kernel_dispatches, 1);
+			scx_bpf_kick_cpu(prio_cpu, SCX_KICK_IDLE);
+			return;
+		}
+	}
+
+	/*
 	 * If the task can only run on the current CPU, dispatch it to the
 	 * corresponding per-CPU DSQ.
 	 */

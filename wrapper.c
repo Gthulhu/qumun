@@ -4,6 +4,7 @@
 // Author: Ian Chen <ychen.desl@gmail.com>
 
 #include "wrapper.h"
+#include <bpf/libbpf.h>
 
 struct main_bpf *global_obj;
 
@@ -73,6 +74,23 @@ void dec_nr_queued(u64 num) {
 
 void destroy_skel(void*skel) {
     main_bpf__destroy(skel);
+}
+
+int update_priority_task(u32 pid, u64 slice) {
+    if (!global_obj || !global_obj->maps.priority_tasks)
+        return -1;
+    return bpf_map__update_elem(global_obj->maps.priority_tasks, 
+                                &pid, sizeof(pid), 
+                                &slice, sizeof(slice), 
+                                BPF_ANY);
+}
+
+int remove_priority_task(u32 pid) {
+    if (!global_obj || !global_obj->maps.priority_tasks)
+        return -1;
+    return bpf_map__delete_elem(global_obj->maps.priority_tasks, 
+                                &pid, sizeof(pid), 
+                                0);
 }
 
 void set_scx_enums(

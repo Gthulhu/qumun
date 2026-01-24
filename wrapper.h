@@ -77,6 +77,10 @@ void dec_nr_queued(u64 num);
 
 void destroy_skel(void *);
 
+int update_priority_task(u32 pid, u64 slice);
+
+int remove_priority_task(u32 pid);
+
 void set_scx_enums(
 	u64 SCX_OPS_NAME_LEN,
 	u64 SCX_SLICE_DFL,
