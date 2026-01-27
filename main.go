@@ -34,12 +34,12 @@ var taskPool = make([]Task, taskPoolSize)
 var taskPoolCount = 0
 var taskPoolHead, taskPoolTail int
 
-func DrainQueuedTask(s *core.Sched) int {
-	var count int
+func DrainQueuedTask(s *core.Sched) uint64 {
+	var count uint64
 	for (taskPoolTail+1)%taskPoolSize != taskPoolHead {
 		var newQueuedTask models.QueuedTask
 		s.DequeueTask(&newQueuedTask)
-		if newQueuedTask.Pid == -1 {
+		if newQueuedTask.Pid == -1 || count == core.GetNrQueued() {
 			s.DecNrQueued(count)
 			return count
 		}

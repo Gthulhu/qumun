@@ -62,13 +62,13 @@ void notify_complete(u64 nr_pending) {
 
 void sub_nr_queued() {
     if (global_obj->bss->nr_queued){
-        global_obj->bss->nr_queued--;
+        __sync_fetch_and_sub(&global_obj->bss->nr_queued, 1);
     }
 }
 
 void dec_nr_queued(u64 num) {
-    if (global_obj->bss->nr_queued){
-        global_obj->bss->nr_queued-=num;
+    if (global_obj->bss->nr_queued >= num){
+        __sync_fetch_and_sub(&global_obj->bss->nr_queued, num);
     }
 }
 

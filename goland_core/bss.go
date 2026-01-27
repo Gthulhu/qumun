@@ -67,7 +67,7 @@ func (s *Sched) SubNrQueued() error {
 	return nil
 }
 
-func (s *Sched) DecNrQueued(num int) error {
+func (s *Sched) DecNrQueued(num uint64) error {
 	C.dec_nr_queued(C.u64(num))
 	return nil
 }
