@@ -86,10 +86,10 @@ dep:
 	git clone -b feat/skel https://github.com/Gthulhu/libbpfgo.git
 
 $(BPF_OBJ): ebpf/%.o:ebpf/%.c
-	clang-17 \
+	$(CGO_CC) \
 		-O2 -g -Wall -target bpf \
 		$(ARCH_DEFINE) $(ARCH_CPU_FLAGS) -mlittle-endian \
-		-idirafter /usr/lib/llvm-17/lib/clang/17/include -idirafter /usr/local/include -idirafter /usr/include/$(ARCH_INCLUDE_DIR) -idirafter /usr/include \
+		-idirafter $(shell clang -print-resource-dir)/include -idirafter /usr/local/include -idirafter /usr/include/$(ARCH_INCLUDE_DIR) -idirafter /usr/include \
 		-I scx/scheds/vmlinux -I scx/build/libbpf/src/usr/include -I scx/build/libbpf/include/uapi -I scx/scheds/include $(ARCH_SCHED_INCLUDE) -I scx/scheds/include/bpf-compat -I scx/scheds/include/lib \
 		-Wno-compare-distinct-pointer-types \
 		-c $< -o $@
