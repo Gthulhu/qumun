@@ -222,7 +222,7 @@ func main() {
 					return
 				}
 
-				err = bpfModule.NotifyComplete(uint64(taskPoolCount))
+				err = core.NotifyComplete(uint64(taskPoolCount))
 				if err != nil {
 					log.Printf("NotifyComplete failed: %v", err)
 					return
