@@ -30,16 +30,18 @@ const (
 
 const taskPoolSize = 4096
 
-var taskPool = make([]Task, taskPoolSize)
-var taskPoolCount = 0
-var taskPoolHead, taskPoolTail int
+var (
+	taskPool                   = make([]Task, taskPoolSize)
+	taskPoolCount              = 0
+	taskPoolHead, taskPoolTail int
+)
 
 func DrainQueuedTask(s *core.Sched) uint64 {
 	var count uint64
 	for (taskPoolTail+1)%taskPoolSize != taskPoolHead {
 		var newQueuedTask models.QueuedTask
 		s.DequeueTask(&newQueuedTask)
-		if newQueuedTask.Pid == -1 || count == core.GetNrQueued() {
+		if newQueuedTask.Pid == -1 || count == s.GetNrQueued() {
 			s.DecNrQueued(count)
 			return count
 		}
@@ -209,7 +211,7 @@ func main() {
 				}
 
 				// Evaluate used task time slice.
-				nrWaiting := core.GetNrQueued() + core.GetNrScheduled() + 1
+				nrWaiting := bpfModule.GetNrQueued() + bpfModule.GetNrScheduled() + 1
 				task.Vtime = t.Vtime
 				task.SliceNs = max(SLICE_NS_DEFAULT/nrWaiting, SLICE_NS_MIN)
 				task.Cpu = cpu
@@ -220,7 +222,7 @@ func main() {
 					return
 				}
 
-				err = core.NotifyComplete(uint64(taskPoolCount))
+				err = bpfModule.NotifyComplete(uint64(taskPoolCount))
 				if err != nil {
 					log.Printf("NotifyComplete failed: %v", err)
 					return

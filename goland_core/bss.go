@@ -50,10 +50,11 @@ func GetUserSchedPid() int {
 	return int(C.get_usersched_pid())
 }
 
-func GetNrQueued() uint64 {
+func (s *Sched) GetNrQueued() uint64 {
 	return uint64(C.get_nr_queued())
 }
-func GetNrScheduled() uint64 {
+
+func (s *Sched) GetNrScheduled() uint64 {
 	return uint64(C.get_nr_scheduled())
 }
 
