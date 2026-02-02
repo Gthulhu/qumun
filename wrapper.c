@@ -85,9 +85,35 @@ int update_priority_task(u32 pid, u64 slice) {
                                 BPF_ANY);
 }
 
+int update_priority_task_with_prio(u32 pid, u64 slice, u32 prio) {
+    if (!global_obj || !global_obj->maps.priority_tasks || 
+        !global_obj->maps.priority_tasks_prio)
+        return -1;
+    
+    int ret = bpf_map__update_elem(global_obj->maps.priority_tasks, 
+                                   &pid, sizeof(pid), 
+                                   &slice, sizeof(slice), 
+                                   BPF_ANY);
+    if (ret != 0)
+        return ret;
+    
+    return bpf_map__update_elem(global_obj->maps.priority_tasks_prio, 
+                                &pid, sizeof(pid), 
+                                &prio, sizeof(prio), 
+                                BPF_ANY);
+}
+
 int remove_priority_task(u32 pid) {
     if (!global_obj || !global_obj->maps.priority_tasks)
         return -1;
+    
+    /* Also remove from priority_tasks_prio if it exists */
+    if (global_obj->maps.priority_tasks_prio) {
+        bpf_map__delete_elem(global_obj->maps.priority_tasks_prio, 
+                             &pid, sizeof(pid), 
+                             0);
+    }
+    
     return bpf_map__delete_elem(global_obj->maps.priority_tasks, 
                                 &pid, sizeof(pid), 
                                 0);

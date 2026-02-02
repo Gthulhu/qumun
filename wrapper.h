@@ -79,6 +79,8 @@ void destroy_skel(void *);
 
 int update_priority_task(u32 pid, u64 slice);
 
+int update_priority_task_with_prio(u32 pid, u64 slice, u32 prio);
+
 int remove_priority_task(u32 pid);
 
 void set_scx_enums(

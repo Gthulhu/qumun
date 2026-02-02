@@ -221,6 +221,22 @@ struct {
 	__uint(max_entries, MAX_ENQUEUED_TASKS);
 } priority_tasks SEC(".maps");
 
+/*
+ * Map to track priority levels (0-20) for priority tasks.
+ *
+ * Priority levels:
+ *   0-9:   High priority - can preempt tasks with lower priority
+ *   10-20: Medium priority - gets vtime reduction but no preemption
+ *
+ * Tasks not in this map are considered normal priority (no special handling).
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, u32);    /* PID */
+	__type(value, u32);  /* priority level 0-20 */
+	__uint(max_entries, MAX_ENQUEUED_TASKS);
+} priority_tasks_prio SEC(".maps");
+
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__type(key, s32);    /* CPU */
@@ -468,16 +484,36 @@ static u64 cpu_to_dsq(s32 cpu)
 }
 
 /*
- * Helper function to update priority tasks map based on vtime.
- * If vtime == 0, add PID to map. If vtime != 0, remove PID from map.
+ * Check if task with prio1 can preempt task with prio2.
+ * Only priority levels 0-9 can preempt, and only tasks with lower priority.
+ * Returns true if preemption is allowed.
  */
-static void update_priority_task_map(u32 pid, u64 vtime, u64 slice)
+static bool can_preempt_by_prio(u32 prio1, u32 prio2)
 {
-	if (vtime == 0) {
-		bpf_map_update_elem(&priority_tasks, &pid, &slice, BPF_ANY);
-	} else {
-		bpf_map_delete_elem(&priority_tasks, &pid);
-	}
+	/* Only priority 0-9 can preempt */
+	if (prio1 > 9)
+		return false;
+	/* Can only preempt lower priority (higher number) tasks */
+	return prio1 < prio2;
+}
+
+/*
+ * Calculate vtime reduction for priority levels 10-20.
+ * Higher priority (lower number) gets more vtime reduction.
+ * Returns the vtime reduction amount.
+ */
+static u64 calc_vtime_reduction(u32 prio, u64 base_vtime)
+{
+	/*
+	 * Priority 10-20 get vtime reduction.
+	 * Priority 10 gets 50% reduction, priority 20 gets 5% reduction.
+	 * Linear interpolation: reduction = (20 - prio) * 5% of base_vtime
+	 */
+	if (prio < 10 || prio > 20)
+		return 0;
+	
+	u64 reduction_pct = (20 - prio) * 5; /* 0-50% */
+	return (base_vtime * reduction_pct) / 100;
 }
 
 /*
@@ -682,7 +718,6 @@ static void dispatch_task(const struct dispatched_task_ctx *task)
 			__sync_fetch_and_add(&nr_user_dispatches, 1);
 		}
 	}
-	update_priority_task_map(task->pid, task->vtime, task->slice_ns);
 
 	/*
 	 * If the cpumask is not valid anymore, ignore the dispatch event.
@@ -1130,33 +1165,81 @@ static void enqueue_task_kernel_mode(struct task_struct *p, u64 enq_flags)
 	/*
 	 * Handle priority tasks with custom dispatch logic (similar to user-space mode).
 	 * Check if the task is in priority_tasks map and dispatch with preemption.
+	 *
+	 * Priority levels 0-9: can preempt tasks with lower priority
+	 * Priority levels 10-20: get vtime reduction but no preemption
 	 */
 	u64 *prio_elem;
-	u64 *running_prio_elem;
+	u32 *task_prio_ptr;
+	u32 *running_prio_ptr;
 	u64 prio_slice;
 	u32 pid = p->pid;
 	s32 prio_cpu = -EBUSY;
-	u64 prio_enq_flags = SCX_ENQ_PREEMPT;
+	u64 prio_enq_flags = 0;
 	u32 *cur_pid_val;
 	u32 cur_pid;
+	u32 task_prio = 21; /* Default: no priority (lowest) */
+	u32 running_prio = 21;
 
 	prio_elem = bpf_map_lookup_elem(&priority_tasks, &pid);
 	if (prio_elem) {
+		task_prio_ptr = bpf_map_lookup_elem(&priority_tasks_prio, &pid);
+		if (task_prio_ptr)
+			task_prio = *task_prio_ptr;
+		else
+			task_prio = 0; /* Default to highest if in priority_tasks but no prio set */
+
+		prio_slice = *prio_elem;
+
+		/*
+		 * Priority 10-20: apply vtime reduction and use normal scheduling
+		 */
+		if (task_prio >= 10 && task_prio <= 20) {
+			u64 vtime_reduction = calc_vtime_reduction(task_prio, p->scx.dsq_vtime);
+			u64 adjusted_vtime = p->scx.dsq_vtime > vtime_reduction ? 
+					     p->scx.dsq_vtime - vtime_reduction : 0;
+
+			prio_cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
+			if (prio_cpu >= 0) {
+				scx_bpf_dsq_insert_vtime(p, cpu_to_dsq(prio_cpu),
+							 prio_slice, adjusted_vtime, enq_flags);
+				__sync_fetch_and_add(&nr_kernel_dispatches, 1);
+				scx_bpf_kick_cpu(prio_cpu, SCX_KICK_IDLE);
+				return;
+			}
+			/* No idle CPU, dispatch to SHARED_DSQ with reduced vtime */
+			scx_bpf_dsq_insert_vtime(p, SHARED_DSQ,
+						 prio_slice, adjusted_vtime, enq_flags);
+			__sync_fetch_and_add(&nr_kernel_dispatches, 1);
+			scx_bpf_kick_cpu(prev_cpu, SCX_KICK_IDLE);
+			return;
+		}
+
+		/*
+		 * Priority 0-9: can preempt lower priority tasks
+		 */
 		prio_cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
 		if (prio_cpu == -EBUSY) {
 			prio_cpu = prev_cpu;
 		}
-		prio_slice = *prio_elem;
+
 		if (prio_cpu >= 0) {
+			prio_enq_flags = SCX_ENQ_PREEMPT; /* Default: preempt */
+
 			cur_pid_val = bpf_map_lookup_elem(&running_task, &prio_cpu);
 			if (cur_pid_val) {
 				cur_pid = *cur_pid_val;
-				running_prio_elem = bpf_map_lookup_elem(&priority_tasks, &cur_pid);
+				running_prio_ptr = bpf_map_lookup_elem(&priority_tasks_prio, &cur_pid);
+				if (running_prio_ptr)
+					running_prio = *running_prio_ptr;
+				else if (bpf_map_lookup_elem(&priority_tasks, &cur_pid))
+					running_prio = 0; /* In priority_tasks but no prio level */
+
 				/*
-				 * If current running task is prioritized, do not preempt it (use SCX_ENQ_HEAD).
-				 * Otherwise, keep the flag equals to SCX_ENQ_PREEMPT.
+				 * Only preempt if this task has higher priority (lower number)
+				 * than the running task.
 				 */
-				if (running_prio_elem) {
+				if (!can_preempt_by_prio(task_prio, running_prio)) {
 					prio_enq_flags = SCX_ENQ_HEAD;
 				}
 			}
@@ -1275,30 +1358,81 @@ void BPF_STRUCT_OPS(goland_enqueue, struct task_struct *p, u64 enq_flags)
 
 	/*
 	 * Handle priority tasks with custom dispatch logic.
+	 *
+	 * Priority levels 0-9: can preempt tasks with lower priority
+	 * Priority levels 10-20: get vtime reduction but no preemption
 	 */
-	u64* elem;
+	u64 *elem;
+	u32 *task_prio_ptr;
+	u32 *running_prio_ptr;
 	u64 slice;
 	u32 pid = p->pid;
 	s32 prio_cpu = -EBUSY;
-	u64 prio_enq_flags = SCX_ENQ_PREEMPT;
-	u32* cur_pid_val;
+	u64 prio_enq_flags = 0;
+	u32 *cur_pid_val;
 	u32 cur_pid;
+	u32 task_prio = 21; /* Default: no priority (lowest) */
+	u32 running_prio = 21;
 
 	elem = bpf_map_lookup_elem(&priority_tasks, &pid);
 	if (elem) {
+		task_prio_ptr = bpf_map_lookup_elem(&priority_tasks_prio, &pid);
+		if (task_prio_ptr)
+			task_prio = *task_prio_ptr;
+		else
+			task_prio = 0; /* Default to highest if in priority_tasks but no prio set */
+
+		slice = *elem;
+
+		/*
+		 * Priority 10-20: apply vtime reduction and use normal scheduling
+		 */
+		if (task_prio >= 10 && task_prio <= 20) {
+			u64 vtime_reduction = calc_vtime_reduction(task_prio, p->scx.dsq_vtime);
+			u64 adjusted_vtime = p->scx.dsq_vtime > vtime_reduction ?
+					     p->scx.dsq_vtime - vtime_reduction : 0;
+
+			prio_cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
+			if (prio_cpu >= 0) {
+				scx_bpf_dsq_insert_vtime(p, cpu_to_dsq(prio_cpu),
+							 slice, adjusted_vtime, enq_flags);
+				__sync_fetch_and_add(&nr_user_dispatches, 1);
+				scx_bpf_kick_cpu(prio_cpu, SCX_KICK_IDLE);
+				return;
+			}
+			/* No idle CPU, dispatch to SHARED_DSQ with reduced vtime */
+			scx_bpf_dsq_insert_vtime(p, SHARED_DSQ,
+						 slice, adjusted_vtime, enq_flags);
+			__sync_fetch_and_add(&nr_user_dispatches, 1);
+			scx_bpf_kick_cpu(prev_cpu, SCX_KICK_IDLE);
+			return;
+		}
+
+		/*
+		 * Priority 0-9: can preempt lower priority tasks
+		 */
 		prio_cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
 		if (prio_cpu == -EBUSY) {
 			prio_cpu = scx_bpf_task_cpu(p);
 		}
-		slice = *elem;
+
 		if (prio_cpu >= 0) {
+			prio_enq_flags = SCX_ENQ_PREEMPT; /* Default: preempt */
+
 			cur_pid_val = bpf_map_lookup_elem(&running_task, &prio_cpu);
 			if (cur_pid_val) {
 				cur_pid = *cur_pid_val;
-				elem = bpf_map_lookup_elem(&priority_tasks, &cur_pid);
-				// If current running task is prioritized, do not preempt it (SCX_ENQ_HEAD).
-				// Otherwise, keep the flag equals to SCX_ENQ_PREEMPT
-				if (elem) {
+				running_prio_ptr = bpf_map_lookup_elem(&priority_tasks_prio, &cur_pid);
+				if (running_prio_ptr)
+					running_prio = *running_prio_ptr;
+				else if (bpf_map_lookup_elem(&priority_tasks, &cur_pid))
+					running_prio = 0; /* In priority_tasks but no prio level */
+
+				/*
+				 * Only preempt if this task has higher priority (lower number)
+				 * than the running task.
+				 */
+				if (!can_preempt_by_prio(task_prio, running_prio)) {
 					prio_enq_flags = SCX_ENQ_HEAD;
 				}
 			}
@@ -1889,13 +2023,15 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(goland_init)
 /*
  * A task is being destroyed.
  *
- * Clean up the task from priority tasks map.
+ * Clean up the task from priority tasks maps.
  */
 void BPF_STRUCT_OPS(goland_exit_task, struct task_struct *p,
 		    struct scx_exit_task_args *args)
 {
-	/* Remove task from priority tasks map */
-	update_priority_task_map(p->pid, 1, 0);
+	u32 pid = p->pid;
+	/* Remove task from priority tasks maps */
+	bpf_map_delete_elem(&priority_tasks, &pid);
+	bpf_map_delete_elem(&priority_tasks_prio, &pid);
 }
 
 /*
