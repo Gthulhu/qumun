@@ -153,6 +153,10 @@ const volatile u64 slice_lag = 40ULL * NSEC_PER_MSEC;
  */
 static u64 vtime_now;
 
+const volatile bool max_time_watchdog = true;
+
+#define THRESHOLD 500000000  /* 500ms */
+
 /*
  * Allocate/re-allocate a new cpumask.
  */
@@ -1961,6 +1965,20 @@ void BPF_STRUCT_OPS(goland_update_idle, s32 cpu, bool idle)
 	}
 }
 
+void BPF_STRUCT_OPS(goland_tick, struct task_struct *p)
+{
+	if (max_time_watchdog && (kernel_mode || !is_usersched_task(p))) {
+		struct task_ctx *tctx = try_lookup_task_ctx(p);
+		if (!tctx)
+			return;
+		u64 now = scx_bpf_now();
+		u64 run_time = now - tctx->start_ts;
+		if (unlikely(run_time > THRESHOLD)) {
+			scx_bpf_kick_cpu(bpf_get_smp_processor_id(), SCX_KICK_PREEMPT);
+			bpf_printk("pid: %d exceed the threshold", p->pid);
+		}
+	}
+}
 /*
  * Scheduling class declaration.
  */
@@ -1968,6 +1986,7 @@ SCX_OPS_DEFINE(goland,
 	       .select_cpu		= (void *)goland_select_cpu,
 	       .enqueue			= (void *)goland_enqueue,
 	       .dispatch		= (void *)goland_dispatch,
+		   .tick            = (void *)goland_tick,
 		   .update_idle		= (void *)goland_update_idle,
 	       .runnable		= (void *)goland_runnable,
 	       .running			= (void *)goland_running,

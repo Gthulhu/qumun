@@ -61,6 +61,8 @@ void set_builtin_idle(bool enabled);
 
 void enable_kernel_mode();
 
+void disable_max_time_watchdog();
+
 void set_early_processing(bool enabled);
 
 void set_default_slice(u64 t);

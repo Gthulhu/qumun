@@ -48,6 +48,10 @@ void enable_kernel_mode() {
     global_obj->rodata->kernel_mode = true;
 }
 
+void disable_max_time_watchdog() {
+    global_obj->rodata->max_time_watchdog = false;
+}
+
 u64 get_nr_scheduled() {
     return global_obj->bss->nr_scheduled;
 }
