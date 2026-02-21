@@ -128,13 +128,19 @@ int remove_priority_task(u32 pid) {
         ret = bpf_map__delete_elem(global_obj->maps.priority_tasks_prio,
                                     &pid, sizeof(pid),
                                     0);
-        if (ret != 0)
+        /* Ignore ENOENT: entry may not exist if added without prio,
+         * or already cleaned up by BPF goland_exit_task */
+        if (ret != 0 && ret != -ENOENT)
             return ret;
     }
 
-    return bpf_map__delete_elem(global_obj->maps.priority_tasks,
-                                &pid, sizeof(pid),
-                                0);
+    ret = bpf_map__delete_elem(global_obj->maps.priority_tasks,
+                               &pid, sizeof(pid),
+                               0);
+    /* Ignore ENOENT: entry may already be cleaned up by BPF goland_exit_task */
+    if (ret == -ENOENT)
+        return 0;
+    return ret;
 }
 
 void set_scx_enums(
