@@ -718,7 +718,7 @@ static s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 	 *
 	 * This is required to support kernels <= 6.16.
 	 */
-	if (!bpf_ksym_exists(scx_bpf_select_cpu_and)) {
+	if (!__COMPAT_HAS_scx_bpf_select_cpu_and) {
 		bool is_idle = false;
 
 		if (!wake_flags)
@@ -1137,7 +1137,7 @@ int rs_select_cpu(struct task_cpu_arg *input)
 	 * ops.select_cpu() and opt.enqueue(), return any idle CPU usable
 	 * by the task in this case.
 	 */
-	if (!bpf_ksym_exists(scx_bpf_select_cpu_and)) {
+	if (!__COMPAT_HAS_scx_bpf_select_cpu_and) {
 		if (!scx_bpf_test_and_clear_cpu_idle(cpu))
 			cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
 	} else {
@@ -1238,7 +1238,6 @@ static void queue_task_to_userspace(struct task_struct *p, s32 prev_cpu, u64 enq
 static void enqueue_task_kernel_mode(struct task_struct *p, u64 enq_flags)
 {
 	s32 prev_cpu = scx_bpf_task_cpu(p), cpu;
-	struct task_ctx *tctx;
 
 	/*
 	 * Always dispatch per-CPU kthreads directly on their target CPU.
@@ -1503,13 +1502,13 @@ void BPF_STRUCT_OPS(goland_dispatch, s32 cpu, struct task_struct *prev)
 		/*
 		 * Consume a task from the per-CPU DSQ.
 		 */
-		if (scx_bpf_dsq_move_to_local(cpu_to_dsq(cpu)))
+		if (scx_bpf_dsq_move_to_local(cpu_to_dsq(cpu), 0))
 			return;
 
 		/*
 		 * Consume a task from the shared DSQ.
 		 */
-		if (scx_bpf_dsq_move_to_local(SHARED_DSQ))
+		if (scx_bpf_dsq_move_to_local(SHARED_DSQ, 0))
 			return;
 
 		/*
@@ -1536,7 +1535,7 @@ void BPF_STRUCT_OPS(goland_dispatch, s32 cpu, struct task_struct *prev)
 	 */
 	if (usersched_has_pending_tasks()) {
 		int consumed = 0;
-		while (scx_bpf_dsq_move_to_local(SCHED_DSQ) && consumed++ < MAX_USERSCHED_DISPATCH)
+		while (scx_bpf_dsq_move_to_local(SCHED_DSQ, 0) && consumed++ < MAX_USERSCHED_DISPATCH)
 			;
 		return;
 	}
@@ -1554,13 +1553,13 @@ void BPF_STRUCT_OPS(goland_dispatch, s32 cpu, struct task_struct *prev)
 	/*
 	 * Consume a task from the per-CPU DSQ.
 	 */
-	if (scx_bpf_dsq_move_to_local(cpu_to_dsq(cpu)))
+	if (scx_bpf_dsq_move_to_local(cpu_to_dsq(cpu), 0))
 		return;
 
 	/*
 	 * Consume a task from the shared DSQ.
 	 */
-	if (scx_bpf_dsq_move_to_local(SHARED_DSQ))
+	if (scx_bpf_dsq_move_to_local(SHARED_DSQ, 0))
 		return;
 
 	/*
