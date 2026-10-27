@@ -11,6 +11,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 	"time"
 
@@ -185,8 +186,13 @@ func main() {
 	notifyCount := 0
 
 	ctx, cancel := context.WithCancel(context.Background())
+	schedulerDone := make(chan struct{})
 
 	go func() {
+		defer close(schedulerDone)
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+
 		var t *models.QueuedTask
 		var task *core.DispatchedTask
 		var err error
@@ -264,6 +270,8 @@ func main() {
 			}
 		}
 	}
+	cancel()
+	<-schedulerDone
 	timer.Stop()
 	log.Println("scheduler exit")
 }

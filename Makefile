@@ -50,10 +50,19 @@ LIBBPF_OBJDIR = $(abspath ./$(OUTPUT)/libbpf)
 LIBBPF_DESTDIR = $(abspath ./$(OUTPUT))
 CLANG_BPF_SYS_INCLUDES := `shell $(CLANG) -v -E - </dev/null 2>&1 | sed -n '/<...> search starts here:/,/End of search list./{ s| \(/.*\)|-idirafter \1|p }'`
 CGOFLAG = $(GOARCH_ENV) CC=$(CGO_CC) CGO_CFLAGS="-I$(BASEDIR) -I$(BASEDIR)/$(OUTPUT)" CGO_LDFLAGS="-lelf -lz $(LIBBPF_OBJ) -lzstd $(BASEDIR)/libwrapper.a"
+GO_LDFLAGS = -checklinkname=0
 
 .PHONY: build
 build: clean $(BPF_OBJ) libbpf libbpf-uapi wrapper
-	$(CGOFLAG) go build -ldflags "-w -s" main.go
+	$(CGOFLAG) go build -ldflags "$(GO_LDFLAGS) -w -s" main.go
+
+.PHONY: bench
+bench:
+	go test -ldflags="$(GO_LDFLAGS)" ./internal/schedbridge -bench=. -benchmem
+
+.PHONY: test-hotpath
+test-hotpath: build
+	$(CGOFLAG) go test -ldflags="$(GO_LDFLAGS)" ./goland_core ./internal/schedbridge ./util
 
 test: build
 	@echo "Running scheduler test..."
@@ -97,7 +106,8 @@ $(BPF_OBJ): ebpf/%.o:ebpf/%.c
 wrapper:
 	bpftool gen skeleton ebpf/main.bpf.o > main.skeleton.h
 	$(CGO_CC) -g -O2 -Wall -fPIC -c wrapper.c -o wrapper.o
-	ar rcs libwrapper.a wrapper.o
+	$(CGO_CC) -g -O2 -Wall -fPIC -c hotpath.c -o hotpath.o
+	ar rcs libwrapper.a wrapper.o hotpath.o
 
 clean:
 	rm libwrapper.a || true

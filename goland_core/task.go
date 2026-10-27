@@ -83,16 +83,8 @@ func NewDispatchedTask(task *models.QueuedTask) *DispatchedTask {
 	}
 }
 
-// func (s *Sched) DispatchTask(t *DispatchedTask) error {
-// 	if err := s.urb.Error(); err != nil {
-// 		return err
-// 	}
-// 	s.dispatch <- fastEncode(t)
-// 	return nil
-// }
-
 func (s *Sched) DispatchTask(t *DispatchedTask) error {
-	return s.urb.Submit(fastEncode(t))
+	return s.dispatchTask(t)
 }
 
 func fastDecode(data []byte, task *models.QueuedTask) error {
@@ -113,9 +105,7 @@ func fastDecode(data []byte, task *models.QueuedTask) error {
 	return nil
 }
 
-func fastEncode(t *DispatchedTask) []byte {
-	data := make([]byte, 8*8) // 64 bytes
-
+func encodeDispatch(data []byte, t *DispatchedTask) {
 	binary.LittleEndian.PutUint32(data[0:4], uint32(t.Pid))
 	binary.LittleEndian.PutUint32(data[4:8], uint32(t.Cpu))
 	binary.LittleEndian.PutUint64(data[8:16], t.Flags)
@@ -123,7 +113,6 @@ func fastEncode(t *DispatchedTask) []byte {
 	binary.LittleEndian.PutUint64(data[24:32], t.Vtime)
 	binary.LittleEndian.PutUint64(data[32:40], t.CpuMaskCnt)
 
-	return data
 }
 
 func IsSMTActive() (bool, error) {

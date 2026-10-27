@@ -32,6 +32,6 @@ jobs:
           cd libbpfgo
           make
           cd ..
-          make build
+          make test-hotpath
           make test
         shell: bash
