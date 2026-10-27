@@ -6,6 +6,8 @@
 package core
 
 import (
+	"time"
+
 	"github.com/Gthulhu/plugin/models"
 )
 
@@ -24,6 +26,10 @@ func (s *Sched) SelectQueuedTask() *models.QueuedTask {
 }
 
 func (s *Sched) SelectCPU(t *models.QueuedTask) (error, int32) {
+	if s.selectLatency != nil {
+		start := time.Now()
+		defer func() { s.selectLatency.observe(uint64(time.Since(start))) }()
+	}
 	if s.plugin != nil {
 		return s.plugin.SelectCPU(s, t)
 	}

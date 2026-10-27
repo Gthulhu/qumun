@@ -16,9 +16,16 @@ import (
 	"unsafe"
 
 	"github.com/Gthulhu/plugin/models"
+	"golang.org/x/sys/unix"
 )
 
 func (s *Sched) BlockTilReadyForDequeue(ctx context.Context) {
+	if s.directQueue {
+		if ctx.Err() == nil && !s.queuedReady && s.queuedErr == nil {
+			s.queuedErr = s.YieldScheduler()
+		}
+		return
+	}
 	for {
 		select {
 		case t, ok := <-s.queue:
@@ -34,7 +41,24 @@ func (s *Sched) BlockTilReadyForDequeue(ctx context.Context) {
 	}
 }
 
+func (s *Sched) QueuedError() error { return s.queuedErr }
+
+func (s *Sched) YieldScheduler() error {
+	_, _, errno := unix.Syscall(unix.SYS_SCHED_YIELD, 0, 0, 0)
+	if errno != 0 {
+		return fmt.Errorf("yield scheduler thread: %w", errno)
+	}
+	return nil
+}
+
 func (s *Sched) ReadyForDequeue() bool {
+	if s.directQueue {
+		if !s.queuedReady {
+			s.dequeueDirect(&s.queuedNext)
+			s.queuedReady = s.queuedNext.Pid != -1
+		}
+		return s.queuedReady
+	}
 	select {
 	case t, ok := <-s.queue:
 		if !ok {
@@ -48,6 +72,15 @@ func (s *Sched) ReadyForDequeue() bool {
 }
 
 func (s *Sched) DequeueTask(task *models.QueuedTask) {
+	if s.directQueue {
+		if s.queuedReady {
+			*task = s.queuedNext
+			s.queuedReady = false
+		} else {
+			s.dequeueDirect(task)
+		}
+		return
+	}
 	select {
 	case t := <-s.queue:
 		err := fastDecode(t, task)

@@ -21,7 +21,60 @@ import (
 var (
 	selectCPUFn    = unsafe.Pointer(C.c_select_cpu_wrapper)
 	dispatchTaskFn = unsafe.Pointer(C.c_dispatch_task_wrapper)
+	dequeueTaskFn  = unsafe.Pointer(C.c_dequeue_task_wrapper)
 )
+
+type dequeueArgs struct {
+	queue    unsafe.Pointer
+	result   int32
+	reserved int32
+	data     [72]byte
+}
+
+var (
+	_ [unsafe.Sizeof(dequeueArgs{}) - C.sizeof_struct_qumun_dequeue_args]byte
+	_ [C.sizeof_struct_qumun_dequeue_args - unsafe.Sizeof(dequeueArgs{})]byte
+	_ [unsafe.Alignof(dequeueArgs{}) - C.QUMUN_DEQUEUE_ALIGN]byte
+	_ [C.QUMUN_DEQUEUE_ALIGN - unsafe.Alignof(dequeueArgs{})]byte
+	_ [unsafe.Offsetof(dequeueArgs{}.queue) - C.QUMUN_DEQUEUE_QUEUE]byte
+	_ [C.QUMUN_DEQUEUE_QUEUE - unsafe.Offsetof(dequeueArgs{}.queue)]byte
+	_ [unsafe.Offsetof(dequeueArgs{}.result) - C.QUMUN_DEQUEUE_RESULT]byte
+	_ [C.QUMUN_DEQUEUE_RESULT - unsafe.Offsetof(dequeueArgs{}.result)]byte
+	_ [unsafe.Offsetof(dequeueArgs{}.data) - C.QUMUN_DEQUEUE_DATA]byte
+	_ [C.QUMUN_DEQUEUE_DATA - unsafe.Offsetof(dequeueArgs{}.data)]byte
+	_ [unsafe.Sizeof(models.QueuedTask{}) - 72]byte
+	_ [72 - unsafe.Sizeof(models.QueuedTask{})]byte
+)
+
+func openQueuedRing(fd int) (unsafe.Pointer, error) {
+	var code C.int
+	queue := C.qumun_queue_open(C.int(fd), &code)
+	if queue == nil {
+		return nil, fmt.Errorf("initialize queued ring: %w", syscall.Errno(-code))
+	}
+	return unsafe.Pointer(queue), nil
+}
+
+func closeQueuedRing(queue unsafe.Pointer) {
+	C.qumun_queue_close((*C.struct_qumun_queue)(queue))
+}
+
+func (s *Sched) dequeueDirect(task *models.QueuedTask) {
+	task.Pid = -1
+	if s.queuedErr != nil {
+		return
+	}
+	args := dequeueArgs{queue: s.queuedRing}
+	schedbridge.Call(dequeueTaskFn, unsafe.Pointer(&args))
+	runtime.KeepAlive(s)
+	if args.result < 0 {
+		s.queuedErr = fmt.Errorf("consume queued ring: %w", syscall.Errno(-args.result))
+	} else if args.result == 1 {
+		s.queuedErr = fastDecode(args.data[:], task)
+	} else if args.result != 0 {
+		s.queuedErr = fmt.Errorf("consume queued ring: unexpected record count %d", args.result)
+	}
+}
 
 type cpuContext struct {
 	pid   int32

@@ -64,6 +64,10 @@ bench:
 test-hotpath: build
 	$(CGOFLAG) go test -ldflags="$(GO_LDFLAGS)" ./goland_core ./internal/schedbridge ./util
 
+.PHONY: bench-select-cpu
+bench-select-cpu:
+	$(CGOFLAG) go test -v -ldflags="$(GO_LDFLAGS)" ./goland_core -run='^$$' -bench=BenchmarkSelectCPU -benchmem -count=5
+
 test: build
 	@echo "Running scheduler test..."
 	@chmod +x scripts/test_scheduler.sh

@@ -5,6 +5,7 @@
 #include <bpf/libbpf.h>
 #include <errno.h>
 #include <string.h>
+#include <stdlib.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -46,4 +47,49 @@ struct user_ring_buffer *qumun_dispatch_open(int fd, int *error) {
 
 void qumun_dispatch_close(struct user_ring_buffer *ring) {
     user_ring_buffer__free(ring);
+}
+
+struct qumun_queue {
+    struct ring_buffer *ring;
+    unsigned char data[72];
+};
+
+static int copy_queued_task(void *ctx, void *data, size_t size) {
+    struct qumun_queue *queue = ctx;
+    if (size != sizeof(queue->data))
+        return -EMSGSIZE;
+    memcpy(queue->data, data, size);
+    return 0;
+}
+
+struct qumun_queue *qumun_queue_open(int fd, int *error) {
+    struct qumun_queue *queue = calloc(1, sizeof(*queue));
+    if (!queue) {
+        *error = -ENOMEM;
+        return NULL;
+    }
+    queue->ring = ring_buffer__new(fd, copy_queued_task, queue, NULL);
+    if (!queue->ring) {
+        *error = -errno;
+        free(queue);
+        return NULL;
+    }
+    *error = 0;
+    return queue;
+}
+
+void qumun_queue_close(struct qumun_queue *queue) {
+    ring_buffer__free(queue->ring);
+    free(queue);
+}
+
+void c_dequeue_task_wrapper(void *opaque) {
+    struct qumun_dequeue_args *args = opaque;
+    if (!args->queue) {
+        args->result = -EINVAL;
+        return;
+    }
+    args->result = ring_buffer__consume_n(args->queue->ring, 1);
+    if (args->result == 1)
+        memcpy(args->data, args->queue->data, sizeof(args->data));
 }

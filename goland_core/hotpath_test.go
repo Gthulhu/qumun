@@ -70,6 +70,126 @@ func TestDispatchUninitialized(t *testing.T) {
 	}
 }
 
+func TestDequeueUninitialized(t *testing.T) {
+	s := &Sched{directQueue: true}
+	task := models.QueuedTask{Pid: 123}
+	s.DequeueTask(&task)
+	if task.Pid != -1 || !errors.Is(s.QueuedError(), syscall.EINVAL) {
+		t.Fatalf("pid=%d error=%v, want -1 and EINVAL", task.Pid, s.QueuedError())
+	}
+	if s.ReadyForDequeue() {
+		t.Fatal("failed queue reported ready")
+	}
+}
+
+func TestQueuedRingInvalidFD(t *testing.T) {
+	ring, err := openQueuedRing(-1)
+	if err == nil || ring != nil {
+		t.Fatalf("ring=%v error=%v, want initialization failure", ring, err)
+	}
+}
+
+func TestQueuedRing(t *testing.T) {
+	m, err := ebpf.NewMap(&ebpf.MapSpec{
+		Type: ebpf.RingBuf, MaxEntries: uint32(syscall.Getpagesize()),
+	})
+	if err != nil {
+		if errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.EACCES) ||
+			errors.Is(err, ebpf.ErrNotSupported) {
+			t.Skipf("BPF ring buffer unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	defer m.Close()
+	ring, err := openQueuedRing(m.FD())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeQueuedRing(ring)
+	s := &Sched{directQueue: true, queuedRing: ring}
+	task := models.QueuedTask{Pid: 123}
+	s.DequeueTask(&task)
+	if task.Pid != -1 || s.QueuedError() != nil || s.ReadyForDequeue() {
+		t.Fatalf("empty ring: pid=%d error=%v", task.Pid, s.QueuedError())
+	}
+
+	var data [72]byte
+	want := models.QueuedTask{
+		Pid: 123, Cpu: 2, NrCpusAllowed: 4, Flags: 1 << 63,
+		StartTs: 10, StopTs: 20, SumExecRuntime: 100, Weight: 100, Vtime: 500, Tgid: 120,
+	}
+	buf := new(bytes.Buffer)
+	if err := binary.Write(buf, binary.LittleEndian, want); err != nil {
+		t.Fatal(err)
+	}
+	copy(data[:], buf.Bytes())
+	instructions := asm.Instructions{}
+	for offset := 0; offset < len(data); offset += 8 {
+		instructions = append(instructions,
+			asm.LoadImm(asm.R0, int64(binary.LittleEndian.Uint64(data[offset:])), asm.DWord),
+			asm.StoreMem(asm.R10, int16(offset-80), asm.R0, asm.DWord))
+	}
+	instructions = append(instructions,
+		asm.LoadMapPtr(asm.R1, m.FD()),
+		asm.Mov.Reg(asm.R2, asm.R10),
+		asm.Add.Imm(asm.R2, -80),
+		asm.Mov.Imm(asm.R3, 72),
+		asm.Mov.Imm(asm.R4, 0),
+		asm.FnRingbufOutput.Call(),
+		asm.Return())
+	prog, err := ebpf.NewProgram(&ebpf.ProgramSpec{
+		Type: ebpf.SocketFilter, License: "GPL", Instructions: instructions,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer prog.Close()
+	publish := func() {
+		t.Helper()
+		if ret, _, err := prog.Test(make([]byte, 64)); err != nil || ret != 0 {
+			t.Fatalf("publish queued task: retval=%d error=%v", ret, err)
+		}
+	}
+	publish()
+	publish()
+	if !s.ReadyForDequeue() || !s.ReadyForDequeue() {
+		t.Fatalf("published ring not ready: %v", s.QueuedError())
+	}
+	for i := 0; i < 2; i++ {
+		before := runtime.NumCgoCall()
+		s.DequeueTask(&task)
+		if task != want || s.QueuedError() != nil {
+			t.Fatalf("record %d: got %+v error=%v, want %+v", i, task, s.QueuedError(), want)
+		}
+		if runtime.NumCgoCall() != before {
+			t.Fatal("dequeue entered standard cgo")
+		}
+	}
+	s.DequeueTask(&task)
+	if task.Pid != -1 || s.QueuedError() != nil {
+		t.Fatalf("drained ring: pid=%d error=%v", task.Pid, s.QueuedError())
+	}
+	if got := testing.AllocsPerRun(100, func() { s.DequeueTask(&task) }); got != 0 {
+		t.Fatalf("empty dequeue allocated %g times", got)
+	}
+
+	instructions[len(instructions)-4] = asm.Mov.Imm(asm.R3, 71)
+	shortProg, err := ebpf.NewProgram(&ebpf.ProgramSpec{
+		Type: ebpf.SocketFilter, License: "GPL", Instructions: instructions,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shortProg.Close()
+	if ret, _, err := shortProg.Test(make([]byte, 64)); err != nil || ret != 0 {
+		t.Fatalf("publish malformed task: retval=%d error=%v", ret, err)
+	}
+	s.DequeueTask(&task)
+	if task.Pid != -1 || !errors.Is(s.QueuedError(), syscall.EMSGSIZE) {
+		t.Fatalf("malformed record: pid=%d error=%v", task.Pid, s.QueuedError())
+	}
+}
+
 func TestSelectCPUUninitialized(t *testing.T) {
 	s := &Sched{}
 	if err, _ := s.SelectCPU(&models.QueuedTask{}); !errors.Is(err, selectFailed) {

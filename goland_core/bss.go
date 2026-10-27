@@ -52,6 +52,12 @@ func LoadSkel() unsafe.Pointer {
 
 var nrQueued, nrScheduled *uint64
 
+// SetUserSchedLoopTid enables experimental wakeup preemption for the pinned loop.
+// Call after locking the scheduling goroutine to its OS thread.
+func (s *Sched) SetUserSchedLoopTid(tid uint32) {
+	schedbridge.StoreUint32(unsafe.Pointer(&C.global_obj.bss.usersched_loop_tid), tid)
+}
+
 func initCounterPointers() {
 	nrQueued = (*uint64)(unsafe.Pointer(&C.global_obj.bss.nr_queued))
 	nrScheduled = (*uint64)(unsafe.Pointer(&C.global_obj.bss.nr_scheduled))

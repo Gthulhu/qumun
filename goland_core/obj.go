@@ -23,17 +23,23 @@ const (
 )
 
 type Sched struct {
-	mod          *bpf.Module
-	plugin       plugin.CustomScheduler
-	bss          *BssMap
-	uei          *UeiMap
-	rodata       *RodataMap
-	structOps    *bpf.BPFMap
-	dispatchRing unsafe.Pointer
-	queue        chan []byte // The map containing tasks that are queued to user space from the kernel.
-	preemptCpu   *ebpf.Program
-	siblingCpu   *ebpf.Program
-	selectCpuPrg *ebpf.Program // Cilium eBPF program for syscall-based invocation
+	mod           *bpf.Module
+	plugin        plugin.CustomScheduler
+	bss           *BssMap
+	uei           *UeiMap
+	rodata        *RodataMap
+	structOps     *bpf.BPFMap
+	dispatchRing  unsafe.Pointer
+	queue         chan []byte // The map containing tasks that are queued to user space from the kernel.
+	directQueue   bool
+	queuedRing    unsafe.Pointer
+	queuedErr     error
+	queuedNext    models.QueuedTask
+	queuedReady   bool
+	preemptCpu    *ebpf.Program
+	siblingCpu    *ebpf.Program
+	selectCpuPrg  *ebpf.Program // Cilium eBPF program for syscall-based invocation
+	selectLatency *latencyHistogram
 }
 
 func init() {
@@ -106,12 +112,19 @@ func (s *Sched) Start() {
 		} else if m.Name() == "main_bpf.rodata" {
 			s.rodata = &RodataMap{m}
 		} else if m.Name() == "queued" {
-			s.queue = make(chan []byte, 128)
-			rb, err := s.mod.InitRingBuf("queued", s.queue)
-			if err != nil {
-				panic(err)
+			if s.directQueue {
+				s.queuedRing, err = openQueuedRing(m.FileDescriptor())
+				if err != nil {
+					panic(err)
+				}
+			} else {
+				s.queue = make(chan []byte, 128)
+				rb, err := s.mod.InitRingBuf("queued", s.queue)
+				if err != nil {
+					panic(err)
+				}
+				rb.Poll(10)
 			}
-			rb.Poll(10)
 		} else if m.Name() == "dispatched" {
 			s.dispatchRing, err = openDispatchRing(m.FileDescriptor())
 			if err != nil {
@@ -226,6 +239,10 @@ func (s *Sched) Attach() error {
 }
 
 func (s *Sched) Close() {
+	if s.queuedRing != nil {
+		closeQueuedRing(s.queuedRing)
+		s.queuedRing = nil
+	}
 	if s.selectCpuPrg != nil {
 		s.selectCpuPrg.Close()
 	}

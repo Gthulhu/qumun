@@ -7,6 +7,14 @@
 #include <stdint.h>
 
 struct user_ring_buffer;
+struct qumun_queue;
+
+struct qumun_dequeue_args {
+    struct qumun_queue *queue;
+    int32_t result;
+    int32_t reserved;
+    unsigned char data[72];
+};
 
 struct qumun_cpu_context {
     int32_t pid;
@@ -30,6 +38,10 @@ struct qumun_dispatch_args {
 };
 
 enum {
+    QUMUN_DEQUEUE_ALIGN = _Alignof(struct qumun_dequeue_args),
+    QUMUN_DEQUEUE_QUEUE = offsetof(struct qumun_dequeue_args, queue),
+    QUMUN_DEQUEUE_RESULT = offsetof(struct qumun_dequeue_args, result),
+    QUMUN_DEQUEUE_DATA = offsetof(struct qumun_dequeue_args, data),
     QUMUN_SELECT_ALIGN = _Alignof(struct qumun_select_args),
     QUMUN_SELECT_FD = offsetof(struct qumun_select_args, fd),
     QUMUN_SELECT_ERROR = offsetof(struct qumun_select_args, error),
@@ -51,5 +63,8 @@ void c_select_cpu_wrapper(void *opaque);
 void c_dispatch_task_wrapper(void *opaque);
 struct user_ring_buffer *qumun_dispatch_open(int fd, int *error);
 void qumun_dispatch_close(struct user_ring_buffer *ring);
+struct qumun_queue *qumun_queue_open(int fd, int *error);
+void qumun_queue_close(struct qumun_queue *queue);
+void c_dequeue_task_wrapper(void *opaque);
 
 #endif

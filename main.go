@@ -8,6 +8,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"log"
 	"os"
 	"os/signal"
@@ -150,8 +151,13 @@ func InsertTaskToPool(
 }
 
 func main() {
+	measureLatency := flag.Bool("measure-latency", false, "report SelectCPU and BPF enqueue-to-dispatch-receive latency on shutdown")
+	flag.Parse()
 	bpfModule := core.LoadSched("main.bpf.o")
 	defer bpfModule.Close()
+	if *measureLatency {
+		bpfModule.EnableLatencyMeasurements()
+	}
 	pid := os.Getpid()
 	err := bpfModule.AssignUserSchedPid(pid)
 	if err != nil {
@@ -272,6 +278,16 @@ func main() {
 	}
 	cancel()
 	<-schedulerDone
+	if *measureLatency {
+		report, err := bpfModule.GetLatencyReport()
+		if err != nil {
+			log.Printf("GetLatencyReport failed: %v", err)
+		} else if data, err := json.Marshal(report); err != nil {
+			log.Printf("marshal latency report failed: %v", err)
+		} else {
+			log.Printf("latency data %s", data)
+		}
+	}
 	timer.Stop()
 	log.Println("scheduler exit")
 }

@@ -110,12 +110,24 @@ func (s *Sched) SetDebug(enabled bool) {
 	schedbridge.StoreBool(unsafe.Pointer(&C.global_obj.rodata.debug), enabled)
 }
 
+// EnableLatencyMeasurements must be called before Start. Read results only
+// after the single scheduling goroutine has stopped.
+func (s *Sched) EnableLatencyMeasurements() {
+	s.selectLatency = &latencyHistogram{}
+	schedbridge.StoreBool(unsafe.Pointer(&C.global_obj.rodata.measure_latency), true)
+}
+
 func (s *Sched) SetBuiltinIdle(enabled bool) {
 	schedbridge.StoreBool(unsafe.Pointer(&C.global_obj.rodata.builtin_idle), enabled)
 }
 
 func (s *Sched) EnableKernelMode() {
 	schedbridge.StoreBool(unsafe.Pointer(&C.global_obj.rodata.kernel_mode), true)
+}
+
+func (s *Sched) EnableAdaptiveWakeup() {
+	s.directQueue = true
+	schedbridge.StoreBool(unsafe.Pointer(&C.global_obj.rodata.adaptive_wakeup), true)
 }
 
 func (s *Sched) DisableMaxTimeWatchdog() {
