@@ -47,6 +47,8 @@ struct user_exit_info {
 };
 #include "main.skeleton.h"
 
+extern struct main_bpf *global_obj;
+
 void *open_skel();
 
 u32 get_usersched_pid();

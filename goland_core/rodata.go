@@ -20,6 +20,7 @@ import (
 	"strings"
 	"unsafe"
 
+	"github.com/Gthulhu/qumun/internal/schedbridge"
 	bpf "github.com/aquasecurity/libbpfgo"
 )
 
@@ -100,33 +101,45 @@ func (s *Sched) GetRoData() (Rodata, error) {
 }
 
 func (s *Sched) AssignUserSchedPid(pid int) error {
-	C.set_kugepagepid(C.u32(KhugepagePid()))
-	C.set_usersched_pid(C.u32(pid))
+	schedbridge.StoreUint32(unsafe.Pointer(&C.global_obj.rodata.khugepaged_pid), KhugepagePid())
+	schedbridge.StoreUint32(unsafe.Pointer(&C.global_obj.rodata.usersched_pid), uint32(pid))
 	return nil
 }
 
 func (s *Sched) SetDebug(enabled bool) {
-	C.set_debug(C.bool(enabled))
+	schedbridge.StoreBool(unsafe.Pointer(&C.global_obj.rodata.debug), enabled)
+}
+
+// EnableLatencyMeasurements must be called before Start. Read results only
+// after the single scheduling goroutine has stopped.
+func (s *Sched) EnableLatencyMeasurements() {
+	s.selectLatency = &latencyHistogram{}
+	schedbridge.StoreBool(unsafe.Pointer(&C.global_obj.rodata.measure_latency), true)
 }
 
 func (s *Sched) SetBuiltinIdle(enabled bool) {
-	C.set_builtin_idle(C.bool(enabled))
+	schedbridge.StoreBool(unsafe.Pointer(&C.global_obj.rodata.builtin_idle), enabled)
 }
 
 func (s *Sched) EnableKernelMode() {
-	C.enable_kernel_mode()
+	schedbridge.StoreBool(unsafe.Pointer(&C.global_obj.rodata.kernel_mode), true)
+}
+
+func (s *Sched) EnableAdaptiveWakeup() {
+	s.directQueue = true
+	schedbridge.StoreBool(unsafe.Pointer(&C.global_obj.rodata.adaptive_wakeup), true)
 }
 
 func (s *Sched) DisableMaxTimeWatchdog() {
-	C.disable_max_time_watchdog()
+	schedbridge.StoreBool(unsafe.Pointer(&C.global_obj.rodata.max_time_watchdog), false)
 }
 
 func (s *Sched) SetEarlyProcessing(enabled bool) {
-	C.set_early_processing(C.bool(enabled))
+	schedbridge.StoreBool(unsafe.Pointer(&C.global_obj.rodata.early_processing), enabled)
 }
 
 func (s *Sched) SetDefaultSlice(t uint64) {
-	C.set_default_slice(C.u64(t))
+	schedbridge.StoreUint64(unsafe.Pointer(&C.global_obj.rodata.default_slice), t)
 }
 
 // KhugepagePid finds and returns the PID of the khugepaged process

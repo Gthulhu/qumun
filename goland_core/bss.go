@@ -9,8 +9,10 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"sync/atomic"
 	"unsafe"
 
+	"github.com/Gthulhu/qumun/internal/schedbridge"
 	bpf "github.com/aquasecurity/libbpfgo"
 )
 
@@ -43,33 +45,48 @@ func (data BssData) String() string {
 }
 
 func LoadSkel() unsafe.Pointer {
-	return C.open_skel()
+	obj := C.open_skel()
+	initCounterPointers()
+	return obj
+}
+
+var nrQueued, nrScheduled *uint64
+
+// SetUserSchedLoopTid enables experimental wakeup preemption for the pinned loop.
+// Call after locking the scheduling goroutine to its OS thread.
+func (s *Sched) SetUserSchedLoopTid(tid uint32) {
+	schedbridge.StoreUint32(unsafe.Pointer(&C.global_obj.bss.usersched_loop_tid), tid)
+}
+
+func initCounterPointers() {
+	nrQueued = (*uint64)(unsafe.Pointer(&C.global_obj.bss.nr_queued))
+	nrScheduled = (*uint64)(unsafe.Pointer(&C.global_obj.bss.nr_scheduled))
 }
 
 func GetUserSchedPid() int {
-	return int(C.get_usersched_pid())
+	return int(schedbridge.LoadUint32(unsafe.Pointer(&C.global_obj.rodata.usersched_pid)))
 }
 
 func (s *Sched) GetNrQueued() uint64 {
-	return uint64(C.get_nr_queued())
+	return atomic.LoadUint64(nrQueued)
 }
 
 func (s *Sched) GetNrScheduled() uint64 {
-	return uint64(C.get_nr_scheduled())
+	return atomic.LoadUint64(nrScheduled)
 }
 
 func NotifyComplete(nr_pending uint64) error {
-	C.notify_complete(C.u64(nr_pending))
+	schedbridge.StoreUint64(unsafe.Pointer(nrScheduled), nr_pending)
 	return nil
 }
 
 func (s *Sched) SubNrQueued() error {
-	C.sub_nr_queued()
+	schedbridge.SubUint64(unsafe.Pointer(nrQueued), 1)
 	return nil
 }
 
 func (s *Sched) DecNrQueued(num uint64) error {
-	C.dec_nr_queued(C.u64(num))
+	schedbridge.SubUint64(unsafe.Pointer(nrQueued), num)
 	return nil
 }
 

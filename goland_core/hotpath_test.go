@@ -1,0 +1,334 @@
+// SPDX-License-Identifier: Apache-2.0
+
+package core
+
+import (
+	"bytes"
+	"encoding/binary"
+	"errors"
+	"runtime"
+	"syscall"
+	"testing"
+	"unsafe"
+
+	"github.com/Gthulhu/plugin/models"
+	"github.com/Gthulhu/qumun/internal/schedbridge"
+	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/asm"
+	"golang.org/x/sys/unix"
+)
+
+func TestSharedCounters(t *testing.T) {
+	oldQueued, oldScheduled := nrQueued, nrScheduled
+	t.Cleanup(func() { nrQueued, nrScheduled = oldQueued, oldScheduled })
+	queued, scheduled := uint64(1<<32+9), uint64(1<<32+3)
+	nrQueued, nrScheduled = &queued, &scheduled
+	s := &Sched{}
+	if got := s.GetNrQueued(); got != queued {
+		t.Fatalf("queued: got %d, want %d", got, queued)
+	}
+	if got := s.GetNrScheduled(); got != scheduled {
+		t.Fatalf("scheduled: got %d, want %d", got, scheduled)
+	}
+	if err := NotifyComplete(123); err != nil || scheduled != 123 {
+		t.Fatalf("notify: scheduled=%d, error=%v", scheduled, err)
+	}
+	if err := s.SubNrQueued(); err != nil || queued != 1<<32+8 {
+		t.Fatalf("subtract one: queued=%d, error=%v", queued, err)
+	}
+	if err := s.DecNrQueued(1<<32 + 8); err != nil || queued != 0 {
+		t.Fatalf("drain: queued=%d, error=%v", queued, err)
+	}
+	if err := s.SubNrQueued(); err != nil || queued != 0 {
+		t.Fatalf("empty queue: queued=%d, error=%v", queued, err)
+	}
+}
+
+func TestDispatchEncoding(t *testing.T) {
+	task := &DispatchedTask{
+		Pid: -123, Cpu: RL_CPU_ANY, Flags: 1<<63 + 1,
+		SliceNs: 123456, Vtime: 1<<63 + 7, CpuMaskCnt: 987,
+	}
+	var args dispatchArgs
+	encodeDispatch(args.data[:], task)
+	var got DispatchedTask
+	if err := binary.Read(bytes.NewReader(args.data[:]), binary.LittleEndian, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got != *task {
+		t.Fatalf("wire record: got %+v, want %+v", got, *task)
+	}
+	if !bytes.Equal(args.data[40:], make([]byte, 24)) {
+		t.Fatal("reserved dispatch bytes must be zero")
+	}
+}
+
+func TestDispatchUninitialized(t *testing.T) {
+	s := &Sched{}
+	if err := s.DispatchTask(&DispatchedTask{}); !errors.Is(err, syscall.EINVAL) {
+		t.Fatalf("got %v, want EINVAL", err)
+	}
+}
+
+func TestDequeueUninitialized(t *testing.T) {
+	s := &Sched{directQueue: true}
+	task := models.QueuedTask{Pid: 123}
+	s.DequeueTask(&task)
+	if task.Pid != -1 || !errors.Is(s.QueuedError(), syscall.EINVAL) {
+		t.Fatalf("pid=%d error=%v, want -1 and EINVAL", task.Pid, s.QueuedError())
+	}
+	if s.ReadyForDequeue() {
+		t.Fatal("failed queue reported ready")
+	}
+}
+
+func TestQueuedRingInvalidFD(t *testing.T) {
+	ring, err := openQueuedRing(-1)
+	if err == nil || ring != nil {
+		t.Fatalf("ring=%v error=%v, want initialization failure", ring, err)
+	}
+}
+
+func TestQueuedRing(t *testing.T) {
+	m, err := ebpf.NewMap(&ebpf.MapSpec{
+		Type: ebpf.RingBuf, MaxEntries: uint32(syscall.Getpagesize()),
+	})
+	if err != nil {
+		if errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.EACCES) ||
+			errors.Is(err, ebpf.ErrNotSupported) {
+			t.Skipf("BPF ring buffer unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	defer m.Close()
+	ring, err := openQueuedRing(m.FD())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeQueuedRing(ring)
+	s := &Sched{directQueue: true, queuedRing: ring}
+	task := models.QueuedTask{Pid: 123}
+	s.DequeueTask(&task)
+	if task.Pid != -1 || s.QueuedError() != nil || s.ReadyForDequeue() {
+		t.Fatalf("empty ring: pid=%d error=%v", task.Pid, s.QueuedError())
+	}
+
+	var data [72]byte
+	want := models.QueuedTask{
+		Pid: 123, Cpu: 2, NrCpusAllowed: 4, Flags: 1 << 63,
+		StartTs: 10, StopTs: 20, SumExecRuntime: 100, Weight: 100, Vtime: 500, Tgid: 120,
+	}
+	buf := new(bytes.Buffer)
+	if err := binary.Write(buf, binary.LittleEndian, want); err != nil {
+		t.Fatal(err)
+	}
+	copy(data[:], buf.Bytes())
+	instructions := asm.Instructions{}
+	for offset := 0; offset < len(data); offset += 8 {
+		instructions = append(instructions,
+			asm.LoadImm(asm.R0, int64(binary.LittleEndian.Uint64(data[offset:])), asm.DWord),
+			asm.StoreMem(asm.R10, int16(offset-80), asm.R0, asm.DWord))
+	}
+	instructions = append(instructions,
+		asm.LoadMapPtr(asm.R1, m.FD()),
+		asm.Mov.Reg(asm.R2, asm.R10),
+		asm.Add.Imm(asm.R2, -80),
+		asm.Mov.Imm(asm.R3, 72),
+		asm.Mov.Imm(asm.R4, 0),
+		asm.FnRingbufOutput.Call(),
+		asm.Return())
+	prog, err := ebpf.NewProgram(&ebpf.ProgramSpec{
+		Type: ebpf.SocketFilter, License: "GPL", Instructions: instructions,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer prog.Close()
+	publish := func() {
+		t.Helper()
+		if ret, _, err := prog.Test(make([]byte, 64)); err != nil || ret != 0 {
+			t.Fatalf("publish queued task: retval=%d error=%v", ret, err)
+		}
+	}
+	publish()
+	publish()
+	if !s.ReadyForDequeue() || !s.ReadyForDequeue() {
+		t.Fatalf("published ring not ready: %v", s.QueuedError())
+	}
+	for i := 0; i < 2; i++ {
+		before := runtime.NumCgoCall()
+		s.DequeueTask(&task)
+		if task != want || s.QueuedError() != nil {
+			t.Fatalf("record %d: got %+v error=%v, want %+v", i, task, s.QueuedError(), want)
+		}
+		if runtime.NumCgoCall() != before {
+			t.Fatal("dequeue entered standard cgo")
+		}
+	}
+	s.DequeueTask(&task)
+	if task.Pid != -1 || s.QueuedError() != nil {
+		t.Fatalf("drained ring: pid=%d error=%v", task.Pid, s.QueuedError())
+	}
+	if got := testing.AllocsPerRun(100, func() { s.DequeueTask(&task) }); got != 0 {
+		t.Fatalf("empty dequeue allocated %g times", got)
+	}
+
+	instructions[len(instructions)-4] = asm.Mov.Imm(asm.R3, 71)
+	shortProg, err := ebpf.NewProgram(&ebpf.ProgramSpec{
+		Type: ebpf.SocketFilter, License: "GPL", Instructions: instructions,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shortProg.Close()
+	if ret, _, err := shortProg.Test(make([]byte, 64)); err != nil || ret != 0 {
+		t.Fatalf("publish malformed task: retval=%d error=%v", ret, err)
+	}
+	s.DequeueTask(&task)
+	if task.Pid != -1 || !errors.Is(s.QueuedError(), syscall.EMSGSIZE) {
+		t.Fatalf("malformed record: pid=%d error=%v", task.Pid, s.QueuedError())
+	}
+}
+
+func TestSelectCPUUninitialized(t *testing.T) {
+	s := &Sched{}
+	if err, _ := s.SelectCPU(&models.QueuedTask{}); !errors.Is(err, selectFailed) {
+		t.Fatalf("got %v, want missing-program error", err)
+	}
+}
+
+func TestSelectCPUInvalidFD(t *testing.T) {
+	args := selectArgs{fd: -1}
+	schedbridge.Call(selectCPUFn, unsafe.Pointer(&args))
+	if args.err >= 0 {
+		t.Fatalf("invalid FD did not return a negative errno: %d", args.err)
+	}
+}
+
+func newSelectCPUProgram(t testing.TB) *ebpf.Program {
+	t.Helper()
+	prog, err := ebpf.NewProgram(&ebpf.ProgramSpec{
+		Type: ebpf.Syscall, License: "GPL", Flags: unix.BPF_F_SLEEPABLE,
+		Instructions: asm.Instructions{
+			asm.LoadMem(asm.R0, asm.R1, 4, asm.Word),
+			asm.Return(),
+		},
+	})
+	if err != nil {
+		if errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.EACCES) ||
+			errors.Is(err, ebpf.ErrNotSupported) {
+			t.Skipf("BPF syscall programs unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { prog.Close() })
+	return prog
+}
+
+func TestSelectCPUProgram(t *testing.T) {
+	prog := newSelectCPUProgram(t)
+	s := &Sched{selectCpuPrg: prog}
+	for _, cpu := range []int32{7, -22} {
+		var context [16]byte
+		binary.LittleEndian.PutUint32(context[0:4], 123)
+		binary.LittleEndian.PutUint32(context[4:8], uint32(cpu))
+		binary.LittleEndian.PutUint64(context[8:16], 1<<63)
+		reference, err := prog.Run(&ebpf.RunOptions{Context: context[:]})
+		if err != nil {
+			t.Fatalf("standard program run: %v", err)
+		}
+		before := runtime.NumCgoCall()
+		err, got := s.SelectCPU(&models.QueuedTask{Pid: 123, Cpu: cpu, Flags: 1 << 63})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if after := runtime.NumCgoCall(); after != before {
+			t.Fatalf("CPU selection entered Cgo: before=%d, after=%d", before, after)
+		}
+		want := int32(reference)
+		if reference > 2147483647 {
+			want = RL_CPU_ANY
+		}
+		if got != want {
+			t.Fatalf("CPU %d: got %d, want %d", cpu, got, want)
+		}
+	}
+	task := models.QueuedTask{Pid: 123, Cpu: 7}
+	if got := testing.AllocsPerRun(100, func() {
+		if err, cpu := s.SelectCPU(&task); err != nil || cpu != 7 {
+			panic("invalid CPU selection")
+		}
+	}); got != 0 {
+		t.Fatalf("got %g Go allocations per CPU selection, want 0", got)
+	}
+}
+
+func BenchmarkSelectCPU(b *testing.B) {
+	prog := newSelectCPUProgram(b)
+	task := models.QueuedTask{Pid: 123, Cpu: 7}
+	b.Run("ProgramRun", func(b *testing.B) {
+		var context [16]byte
+		binary.LittleEndian.PutUint32(context[0:4], uint32(task.Pid))
+		binary.LittleEndian.PutUint32(context[4:8], uint32(task.Cpu))
+		binary.LittleEndian.PutUint64(context[8:16], task.Flags)
+		opts := ebpf.RunOptions{Context: context[:]}
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			if cpu, err := prog.Run(&opts); err != nil || cpu != 7 {
+				b.Fatalf("CPU: got %d, error %v", cpu, err)
+			}
+		}
+	})
+	b.Run("Asmcgocall", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			if err, cpu := runSelectCPU(prog, &task); err != nil || cpu != 7 {
+				b.Fatalf("CPU: got %d, error %v", cpu, err)
+			}
+		}
+	})
+}
+
+func TestDispatchRingFull(t *testing.T) {
+	m, err := ebpf.NewMap(&ebpf.MapSpec{
+		Type: ebpf.UserRingbuf, MaxEntries: uint32(syscall.Getpagesize()),
+	})
+	if err != nil {
+		if errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.EACCES) ||
+			errors.Is(err, ebpf.ErrNotSupported) {
+			t.Skipf("BPF user ring buffer unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	defer m.Close()
+	ring, err := openDispatchRing(m.FD())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeDispatchRing(ring)
+	s := &Sched{dispatchRing: ring}
+	task := DispatchedTask{Pid: 123}
+	if got := testing.AllocsPerRun(10, func() {
+		if err := s.DispatchTask(&task); err != nil {
+			panic(err)
+		}
+	}); got != 0 {
+		t.Fatalf("got %g Go allocations per dispatch, want 0", got)
+	}
+	submitted := 0
+	for i := 0; i < syscall.Getpagesize(); i++ {
+		err := s.DispatchTask(&DispatchedTask{Pid: int32(i + 1)})
+		if errors.Is(err, syscall.ENOSPC) {
+			if submitted == 0 {
+				t.Fatal("ring was full before any submissions")
+			}
+			return
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		submitted++
+	}
+	t.Fatal("dispatch did not report a full ring")
+}

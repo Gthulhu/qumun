@@ -23,18 +23,23 @@ const (
 )
 
 type Sched struct {
-	mod          *bpf.Module
-	plugin       plugin.CustomScheduler
-	bss          *BssMap
-	uei          *UeiMap
-	rodata       *RodataMap
-	structOps    *bpf.BPFMap
-	urb          *bpf.UserRingBuffer
-	queue        chan []byte // The map containing tasks that are queued to user space from the kernel.
-	dispatch     chan []byte
-	preemptCpu   *ebpf.Program
-	siblingCpu   *ebpf.Program
-	selectCpuPrg *ebpf.Program // Cilium eBPF program for syscall-based invocation
+	mod           *bpf.Module
+	plugin        plugin.CustomScheduler
+	bss           *BssMap
+	uei           *UeiMap
+	rodata        *RodataMap
+	structOps     *bpf.BPFMap
+	dispatchRing  unsafe.Pointer
+	queue         chan []byte // The map containing tasks that are queued to user space from the kernel.
+	directQueue   bool
+	queuedRing    unsafe.Pointer
+	queuedErr     error
+	queuedNext    models.QueuedTask
+	queuedReady   bool
+	preemptCpu    *ebpf.Program
+	siblingCpu    *ebpf.Program
+	selectCpuPrg  *ebpf.Program // Cilium eBPF program for syscall-based invocation
+	selectLatency *latencyHistogram
 }
 
 func init() {
@@ -69,6 +74,7 @@ func (s *Sched) Start() {
 	var err error
 	bpfModule := s.mod
 	bpfModule.BPFLoadObject()
+	initCounterPointers()
 	iters := bpfModule.Iterator()
 	for {
 		prog := iters.NextProgram()
@@ -106,19 +112,24 @@ func (s *Sched) Start() {
 		} else if m.Name() == "main_bpf.rodata" {
 			s.rodata = &RodataMap{m}
 		} else if m.Name() == "queued" {
-			s.queue = make(chan []byte, 128)
-			rb, err := s.mod.InitRingBuf("queued", s.queue)
-			if err != nil {
-				panic(err)
+			if s.directQueue {
+				s.queuedRing, err = openQueuedRing(m.FileDescriptor())
+				if err != nil {
+					panic(err)
+				}
+			} else {
+				s.queue = make(chan []byte, 128)
+				rb, err := s.mod.InitRingBuf("queued", s.queue)
+				if err != nil {
+					panic(err)
+				}
+				rb.Poll(10)
 			}
-			rb.Poll(10)
 		} else if m.Name() == "dispatched" {
-			s.dispatch = make(chan []byte, 128)
-			s.urb, err = s.mod.InitUserRingBuf("dispatched", s.dispatch)
+			s.dispatchRing, err = openDispatchRing(m.FileDescriptor())
 			if err != nil {
 				panic(err)
 			}
-			// s.urb.Start()
 		}
 		if m.Type().String() == "BPF_MAP_TYPE_STRUCT_OPS" {
 			s.structOps = m
@@ -152,12 +163,6 @@ func (s *Sched) Start() {
 	}
 }
 
-type task_cpu_arg struct {
-	pid   int32
-	cpu   int32
-	flags uint64
-}
-
 var selectFailed error = fmt.Errorf("prog (selectCpu) not found")
 
 func (s *Sched) DefaultSelectCPU(t *models.QueuedTask) (error, int32) {
@@ -169,26 +174,7 @@ func (s *Sched) selectCPU(t *models.QueuedTask) (error, int32) {
 		return selectFailed, 0
 	}
 
-	arg := task_cpu_arg{
-		pid:   t.Pid,
-		cpu:   t.Cpu,
-		flags: t.Flags,
-	}
-
-	data := (*[16]byte)(unsafe.Pointer(&arg))[:]
-
-	ret, err := s.selectCpuPrg.Run(&ebpf.RunOptions{
-		Context: data[:],
-	})
-	if err != nil {
-		return err, 0
-	}
-
-	retVal := int32(ret)
-	if ret > 2147483647 {
-		return nil, RL_CPU_ANY
-	}
-	return nil, retVal
+	return runSelectCPU(s.selectCpuPrg, t)
 }
 
 type preempt_arg struct {
@@ -253,6 +239,10 @@ func (s *Sched) Attach() error {
 }
 
 func (s *Sched) Close() {
+	if s.queuedRing != nil {
+		closeQueuedRing(s.queuedRing)
+		s.queuedRing = nil
+	}
 	if s.selectCpuPrg != nil {
 		s.selectCpuPrg.Close()
 	}
@@ -262,6 +252,9 @@ func (s *Sched) Close() {
 	if s.preemptCpu != nil {
 		s.preemptCpu.Close()
 	}
-	s.urb.Close()
+	if s.dispatchRing != nil {
+		closeDispatchRing(s.dispatchRing)
+		s.dispatchRing = nil
+	}
 	s.mod.Close()
 }

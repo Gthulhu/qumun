@@ -118,6 +118,14 @@ volatile u64 nr_failed_dispatches, nr_sched_congested;
 
 /* Report additional debugging information */
 const volatile bool debug;
+const volatile bool measure_latency;
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 64);
+	__type(key, u32);
+	__type(value, u64);
+} dispatch_latency SEC(".maps");
 
 const volatile bool early_processing;
 
@@ -138,6 +146,7 @@ const volatile bool builtin_idle;
 const volatile bool smt_enabled = true;
 
 const volatile bool kernel_mode = false;
+const volatile bool adaptive_wakeup = false;
 
 /*
  * Maximum time slice lag for kernel mode.
@@ -154,6 +163,11 @@ const volatile u64 slice_lag = 40ULL * NSEC_PER_MSEC;
 static u64 vtime_now;
 
 const volatile bool max_time_watchdog = true;
+
+/* Set only for the opt-in loop wakeup preemption experiment. */
+u32 usersched_loop_tid;
+static u64 usersched_last_preempt_at;
+#define USERSCHED_PREEMPT_INTERVAL_NS NSEC_PER_MSEC
 
 #define THRESHOLD 500000000  /* 500ms */
 
@@ -298,6 +312,7 @@ struct task_ctx {
 	 * Execution time (in nanoseconds) since the last sleep event.
 	 */
 	u64 exec_runtime;
+	u64 previous_burst_runtime;
 
 	/*
 	 * Accumulated vruntime since last sleep (kernel mode).
@@ -313,6 +328,7 @@ struct task_ctx {
 	 * Wakeup frequency (kernel mode).
 	 */
 	u64 wakeup_freq;
+	u64 userspace_enqueued_at;
 };
 
 /* Map that contains task-local storage. */
@@ -360,14 +376,6 @@ struct {
  * user-space scheduler and check if there is any pending activity.
  */
 #define USERSCHED_TIMER_NS (NSEC_PER_SEC / 10)
-
-/*
- * Return true if the target task @p is the user-space scheduler.
- */
-static inline bool is_usersched_task(const struct task_struct *p)
-{
-	return p->pid == usersched_pid;
-}
 
 /*
  * Return true if the target task @p belongs to the user-space scheduler.
@@ -762,15 +770,73 @@ static void kick_task_cpu(const struct task_struct *p, s32 cpu)
  * Dispatch a task to a target per-CPU DSQ, waking up the corresponding CPU, if
  * needed.
  */
+u64 adaptive_requests, adaptive_preempts;
+u64 adaptive_no_running, adaptive_not_earlier, adaptive_protected;
+
+static void preempt_later_deadline(const struct dispatched_task_ctx *task)
+{
+	s32 cpu = task->cpu;
+	u32 *pid = bpf_map_lookup_elem(&running_task, &cpu);
+	struct task_struct *running;
+	struct task_ctx *tctx;
+
+	__sync_fetch_and_add(&adaptive_requests, 1);
+	if (!pid || *pid == task->pid)
+		return;
+	running = bpf_task_from_pid(*pid);
+	if (!running)
+		return;
+	tctx = try_lookup_task_ctx(running);
+	if (!scx_bpf_task_running(running) || scx_bpf_task_cpu(running) != cpu)
+		__sync_fetch_and_add(&adaptive_no_running, 1);
+	else if (!time_before(task->vtime, running->scx.dsq_vtime))
+		__sync_fetch_and_add(&adaptive_not_earlier, 1);
+	else if (is_belong_usersched_task(running) || !tctx)
+		__sync_fetch_and_add(&adaptive_protected, 1);
+	else {
+		__sync_fetch_and_add(&adaptive_preempts, 1);
+		scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
+	}
+	bpf_task_release(running);
+}
+
+static void record_dispatch_latency(struct task_struct *p)
+{
+	struct task_ctx *tctx;
+	u64 elapsed, *count;
+	u32 bucket = 0;
+
+	if (!measure_latency)
+		return;
+	tctx = try_lookup_task_ctx(p);
+	if (!tctx || !tctx->userspace_enqueued_at)
+		return;
+	elapsed = bpf_ktime_get_ns() - tctx->userspace_enqueued_at;
+	tctx->userspace_enqueued_at = 0;
+	/* Bucket i covers [2^i, 2^(i+1)-1] ns; bucket 0 also includes zero. */
+	for (int i = 0; i < 63; i++) {
+		if (elapsed <= 1)
+			break;
+		elapsed >>= 1;
+		bucket++;
+	}
+	count = bpf_map_lookup_elem(&dispatch_latency, &bucket);
+	if (count)
+		__sync_fetch_and_add(count, 1);
+}
+
 static void dispatch_task(const struct dispatched_task_ctx *task)
 {
 	struct task_struct *p;
 	s32 prev_cpu;
+	u64 enq_flags = adaptive_wakeup ?
+		task->flags & ~SCX_ENQ_PREEMPT : task->flags;
 
 	/* Ignore entry if the task doesn't exist anymore */
 	p = bpf_task_from_pid(task->pid);
 	if (!p)
 		return;
+	record_dispatch_latency(p);
 	prev_cpu = scx_bpf_task_cpu(p);
 
 	/*
@@ -779,7 +845,7 @@ static void dispatch_task(const struct dispatched_task_ctx *task)
 	 */
 	if (task->cpu == RL_CPU_ANY) {
 		scx_bpf_dsq_insert_vtime(p, SHARED_DSQ,
-					 task->slice_ns, task->vtime, task->flags);
+					 task->slice_ns, task->vtime, enq_flags);
 		kick_task_cpu(p, prev_cpu);
 
 		goto out_release;
@@ -792,7 +858,7 @@ static void dispatch_task(const struct dispatched_task_ctx *task)
 	 */
 	if (!bpf_cpumask_test_cpu(task->cpu, p->cpus_ptr)) {
 		scx_bpf_dsq_insert_vtime(p, SHARED_DSQ,
-					 task->slice_ns, task->vtime, task->flags);
+					 task->slice_ns, task->vtime, enq_flags);
 		__sync_fetch_and_add(&nr_bounce_dispatches, 1);
 		kick_task_cpu(p, prev_cpu);
 
@@ -805,7 +871,7 @@ static void dispatch_task(const struct dispatched_task_ctx *task)
 	 */
 	if (task->vtime) {
 		scx_bpf_dsq_insert_vtime(p, cpu_to_dsq(task->cpu),
-				task->slice_ns, task->vtime, task->flags);
+				task->slice_ns, task->vtime, enq_flags);
 		__sync_fetch_and_add(&nr_user_dispatches, 1);
 	} else {
 		s32 cur_pid;
@@ -814,7 +880,7 @@ static void dispatch_task(const struct dispatched_task_ctx *task)
 		elem = bpf_map_lookup_elem(&priority_tasks, &cur_pid);
 		if (!elem){
 			scx_bpf_dsq_insert_vtime(p, cpu_to_dsq(task->cpu),
-				task->slice_ns, task->vtime, task->flags);
+				task->slice_ns, task->vtime, enq_flags);
 			__sync_fetch_and_add(&nr_user_dispatches, 1);
 		}
 	}
@@ -835,6 +901,8 @@ static void dispatch_task(const struct dispatched_task_ctx *task)
 		goto out_release;
 	}
 
+	if (adaptive_wakeup && (task->flags & SCX_ENQ_PREEMPT))
+		preempt_later_deadline(task);
 	scx_bpf_kick_cpu(task->cpu, SCX_KICK_IDLE);
 
 out_release:
@@ -1171,7 +1239,9 @@ static void get_task_info(struct queued_task_ctx *task,
 	task->flags = enq_flags;
 	task->start_ts = tctx ? tctx->start_ts : 0;
 	task->stop_ts = tctx ? tctx->stop_ts : 0;
-	task->exec_runtime = tctx ? tctx->exec_runtime : 0;
+	task->exec_runtime = tctx ?
+		(adaptive_wakeup && (enq_flags & SCX_ENQ_WAKEUP) ?
+		 tctx->previous_burst_runtime : tctx->exec_runtime) : 0;
 	task->weight = p->scx.weight;
 	task->vtime = p->scx.dsq_vtime;
 	task->tgid = p->tgid;
@@ -1224,8 +1294,15 @@ static void queue_task_to_userspace(struct task_struct *p, s32 prev_cpu, u64 enq
 	 */
 	dbg_msg("enqueue: pid=%d (%s)", p->pid, p->comm);
 	get_task_info(task, p, prev_cpu, enq_flags);
-	bpf_ringbuf_submit(task, 0);
+	if (measure_latency) {
+		struct task_ctx *tctx = try_lookup_task_ctx(p);
+
+		if (tctx)
+			tctx->userspace_enqueued_at = bpf_ktime_get_ns();
+	}
+	/* Account before publishing: the consumer checks nr_queued after dequeue. */
 	__sync_fetch_and_add(&nr_queued, 1);
+	bpf_ringbuf_submit(task, 0);
 }
 
 /*
@@ -1307,6 +1384,38 @@ static void enqueue_task_kernel_mode(struct task_struct *p, u64 enq_flags)
  * user-space scheduler is not required, or enqueue it to be processed by the
  * scheduler.
  */
+static void enqueue_usersched_task(struct task_struct *p, u64 enq_flags)
+{
+	if (usersched_has_pending_tasks()) {
+		s32 cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
+
+		if (cpu >= 0) {
+			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu,
+					   default_slice, SCX_ENQ_LAST);
+			scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+			return;
+		}
+
+		if (usersched_loop_tid && p->pid == usersched_loop_tid &&
+		    (enq_flags & SCX_ENQ_WAKEUP)) {
+			u64 now = scx_bpf_now();
+			u64 last = usersched_last_preempt_at;
+
+			cpu = scx_bpf_task_cpu(p);
+			if (bpf_cpumask_test_cpu(cpu, p->cpus_ptr) &&
+			    now - last >= USERSCHED_PREEMPT_INTERVAL_NS &&
+			    __sync_val_compare_and_swap(&usersched_last_preempt_at,
+							last, now) == last) {
+				scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu,
+						   default_slice, SCX_ENQ_PREEMPT);
+				scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
+				return;
+			}
+		}
+	}
+	scx_bpf_dsq_insert(p, SCHED_DSQ, default_slice, SCX_ENQ_LAST);
+}
+
 void BPF_STRUCT_OPS(goland_enqueue, struct task_struct *p, u64 enq_flags)
 {
 	s32 prev_cpu = scx_bpf_task_cpu(p), cpu;
@@ -1334,20 +1443,7 @@ void BPF_STRUCT_OPS(goland_enqueue, struct task_struct *p, u64 enq_flags)
 	 * scheduling action to do.
 	 */
 	if (is_belong_usersched_task(p)) {
-		if (usersched_has_pending_tasks()) {
-			/*
-			 * Try to find an idle CPU and dispatch directly to reduce latency.
-			 * This avoids the overhead of going through SCHED_DSQ.
-			 */
-			cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
-			if (cpu >= 0) {
-				scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu,
-					default_slice, SCX_ENQ_LAST);
-				scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
-				return;
-			}
-		}
-		scx_bpf_dsq_insert(p, SCHED_DSQ, default_slice, SCX_ENQ_LAST);
+		enqueue_usersched_task(p, enq_flags);
 		return;
 	}
 
@@ -1529,26 +1625,25 @@ void BPF_STRUCT_OPS(goland_dispatch, s32 cpu, struct task_struct *prev)
 	 * ============================================================
 	 */
 
-	/*
-	 * Dispatch the user-space scheduler if there's any pending action
-	 * to do. Keep consuming from SCHED_DSQ until it's empty.
-	 */
-	if (usersched_has_pending_tasks()) {
-		int consumed = 0;
-		while (scx_bpf_dsq_move_to_local(SCHED_DSQ, 0) && consumed++ < MAX_USERSCHED_DISPATCH)
-			;
-		return;
-	}
-
-	/*
-	 * Consume all tasks from the @dispatched list and immediately
-	 * dispatch them on the target CPU decided by the user-space
-	 * scheduler.
-	 */
+	/* Publish completed Go decisions before scheduling more policy work. */
 	s32 ret = bpf_user_ringbuf_drain(&dispatched,
 				handle_dispatched_task, NULL, BPF_RB_NO_WAKEUP);
 	if (ret < 0)
 		dbg_msg("User ringbuf drain error: %d", ret);
+
+	/*
+	 * Dispatch the user-space scheduler if there's any pending action
+	 * to do, up to MAX_USERSCHED_DISPATCH tasks per invocation.
+	 * If none can run here, continue servicing the other queues.
+	 */
+	if (usersched_has_pending_tasks()) {
+		int consumed = 0;
+		while (consumed < MAX_USERSCHED_DISPATCH &&
+		       scx_bpf_dsq_move_to_local(SCHED_DSQ, 0))
+			consumed++;
+		if (consumed)
+			return;
+	}
 
 	/*
 	 * Consume a task from the per-CPU DSQ.
@@ -1587,6 +1682,8 @@ void BPF_STRUCT_OPS(goland_runnable, struct task_struct *p, u64 enq_flags)
 	if (!tctx)
 		return;
 
+	if (adaptive_wakeup)
+		tctx->previous_burst_runtime = tctx->exec_runtime;
 	tctx->exec_runtime = 0;
 
 	/*
@@ -1617,7 +1714,7 @@ void BPF_STRUCT_OPS(goland_running, struct task_struct *p)
 	u32 pid = p->pid;
 	bpf_map_update_elem(&running_task, &cpu, &pid, BPF_ANY);
 
-	if (!kernel_mode && is_usersched_task(p)) {
+	if (!kernel_mode && is_belong_usersched_task(p)) {
 		usersched_last_run_at = scx_bpf_now();
 		return;
 	}
@@ -2035,7 +2132,7 @@ void BPF_STRUCT_OPS(goland_update_idle, s32 cpu, bool idle)
 
 void BPF_STRUCT_OPS(goland_tick, struct task_struct *p)
 {
-	if (max_time_watchdog && (kernel_mode || !is_usersched_task(p))) {
+	if (max_time_watchdog && (kernel_mode || !is_belong_usersched_task(p))) {
 		struct task_ctx *tctx = try_lookup_task_ctx(p);
 		if (!tctx)
 			return;
