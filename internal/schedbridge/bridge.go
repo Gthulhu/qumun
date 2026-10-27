@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
-// Package schedbridge calls bounded, callback-free C memory operations on g0.
-// Never use this path for blocking work, allocation, or calls back into Go.
+// Package schedbridge calls callback-free C wrappers on g0. Call is for bounded
+// memory operations; CallSyscall includes runtime bookkeeping for syscalls.
 package schedbridge
 
 /*
@@ -15,10 +15,21 @@ import "unsafe"
 //go:noescape
 func asmcgocall(fn, arg unsafe.Pointer) int32
 
+//go:linkname cgocall runtime.cgocall
+//go:noescape
+func cgocall(fn, arg unsafe.Pointer) int32
+
 // Call invokes a bounded C wrapper. fn must be a C ABI function accepting one
 // void pointer, with no blocking, allocation, or callbacks into Go.
 func Call(fn, arg unsafe.Pointer) {
 	asmcgocall(fn, arg)
+}
+
+// CallSyscall invokes a C wrapper through runtime.cgocall, which uses
+// asmcgocall with syscall, GC, and signal bookkeeping. Unlike Call, it lets the
+// runtime reclaim P if the syscall blocks. fn must not call Go or retain arg.
+func CallSyscall(fn, arg unsafe.Pointer) {
+	cgocall(fn, arg)
 }
 
 var (

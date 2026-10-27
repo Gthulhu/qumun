@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"runtime"
 	"syscall"
 	"testing"
 	"unsafe"
@@ -84,7 +85,8 @@ func TestSelectCPUInvalidFD(t *testing.T) {
 	}
 }
 
-func TestSelectCPUProgram(t *testing.T) {
+func newSelectCPUProgram(t testing.TB) *ebpf.Program {
+	t.Helper()
 	prog, err := ebpf.NewProgram(&ebpf.ProgramSpec{
 		Type: ebpf.Syscall, License: "GPL", Flags: unix.BPF_F_SLEEPABLE,
 		Instructions: asm.Instructions{
@@ -99,7 +101,12 @@ func TestSelectCPUProgram(t *testing.T) {
 		}
 		t.Fatal(err)
 	}
-	defer prog.Close()
+	t.Cleanup(func() { prog.Close() })
+	return prog
+}
+
+func TestSelectCPUProgram(t *testing.T) {
+	prog := newSelectCPUProgram(t)
 	s := &Sched{selectCpuPrg: prog}
 	for _, cpu := range []int32{7, -22} {
 		var context [16]byte
@@ -110,9 +117,13 @@ func TestSelectCPUProgram(t *testing.T) {
 		if err != nil {
 			t.Fatalf("standard program run: %v", err)
 		}
+		before := runtime.NumCgoCall()
 		err, got := s.SelectCPU(&models.QueuedTask{Pid: 123, Cpu: cpu, Flags: 1 << 63})
 		if err != nil {
 			t.Fatal(err)
+		}
+		if after := runtime.NumCgoCall(); after != before {
+			t.Fatalf("CPU selection entered Cgo: before=%d, after=%d", before, after)
 		}
 		want := int32(reference)
 		if reference > 2147483647 {
@@ -130,6 +141,33 @@ func TestSelectCPUProgram(t *testing.T) {
 	}); got != 0 {
 		t.Fatalf("got %g Go allocations per CPU selection, want 0", got)
 	}
+}
+
+func BenchmarkSelectCPU(b *testing.B) {
+	prog := newSelectCPUProgram(b)
+	task := models.QueuedTask{Pid: 123, Cpu: 7}
+	b.Run("ProgramRun", func(b *testing.B) {
+		var context [16]byte
+		binary.LittleEndian.PutUint32(context[0:4], uint32(task.Pid))
+		binary.LittleEndian.PutUint32(context[4:8], uint32(task.Cpu))
+		binary.LittleEndian.PutUint64(context[8:16], task.Flags)
+		opts := ebpf.RunOptions{Context: context[:]}
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			if cpu, err := prog.Run(&opts); err != nil || cpu != 7 {
+				b.Fatalf("CPU: got %d, error %v", cpu, err)
+			}
+		}
+	})
+	b.Run("Asmcgocall", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			if err, cpu := runSelectCPU(prog, &task); err != nil || cpu != 7 {
+				b.Fatalf("CPU: got %d, error %v", cpu, err)
+			}
+		}
+	})
 }
 
 func TestDispatchRingFull(t *testing.T) {

@@ -3,13 +3,87 @@
 package schedbridge
 
 import (
+	"os"
 	"runtime"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
 	"unsafe"
 )
+
+func TestSyscallAllowsGCAndScheduling(t *testing.T) {
+	previous := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(previous)
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	defer writer.Close()
+
+	started := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+		tid := syscall.Gettid()
+		close(started)
+		value, err := readByte(int(reader.Fd()))
+		if err != nil || value != 42 {
+			t.Errorf("read: value=%d, error=%v", value, err)
+		}
+		if got := syscall.Gettid(); got != tid {
+			t.Errorf("thread changed: got %d, want %d", got, tid)
+		}
+	}()
+	<-started
+	// With one P, this timer and GC cannot progress if the C read holds P.
+	time.Sleep(20 * time.Millisecond)
+	runtime.GC()
+	if _, err := writer.Write([]byte{42}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("syscall did not resume")
+	}
+}
+
+func TestSyscallBridge(t *testing.T) {
+	before := runtime.NumCgoCall()
+	if got := callGetpid(); got != int64(os.Getpid()) {
+		t.Fatalf("PID: got %d, want %d", got, os.Getpid())
+	}
+	if after := runtime.NumCgoCall(); after != before+1 {
+		t.Fatalf("missing runtime bookkeeping: before=%d, after=%d", before, after)
+	}
+	if got := testing.AllocsPerRun(1000, func() {
+		if callGetpid() != int64(os.Getpid()) {
+			panic("invalid PID")
+		}
+	}); got != 0 {
+		t.Fatalf("got %g allocations per syscall, want 0", got)
+	}
+}
+
+func BenchmarkSyscall(b *testing.B) {
+	b.Run("Cgo", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			benchmarkResult = uint64(cgoGetpid())
+		}
+	})
+	b.Run("Bridge", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			benchmarkResult = uint64(callGetpid())
+		}
+	})
+}
 
 func TestMemoryOperations(t *testing.T) {
 	var wide uint64

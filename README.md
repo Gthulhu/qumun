@@ -84,8 +84,8 @@ The scheduling goroutine uses `runtime.LockOSThread` with a deferred
 This pins M, not P, and does not disable normal Go safe points or preemption.
 Shutdown cancels and joins the loop before releasing its C ring buffer.
 
-CPU selection, non-blocking dispatch, BSS counter updates, and scalar rodata
-access use `internal/schedbridge`.
+CPU selection, non-blocking dispatch, BSS counter updates, and scalar rodata access use
+`internal/schedbridge.Call`.
 It passes a C wrapper's function pointer directly to `runtime.asmcgocall`
 (`//go:linkname`, `//go:noescape`), switching to the current M's g0 stack
 without `runtime.cgocall`, `entersyscall`, or `exitsyscall`. These calls do not
@@ -101,7 +101,9 @@ until the syscall returns.
 
 `SelectCPU` runs the existing bounded `rs_select_cpu` program via one
 `BPF_PROG_TEST_RUN` syscall, preserving negative CPU fallback and single-run
-`EINTR` behavior. `DispatchTask` uses non-blocking
+`EINTR` behavior. It uses the direct `schedbridge.Call` path, avoiding
+`ebpf.Program.Run()` context serialization and Go allocations.
+`DispatchTask` uses non-blocking
 `user_ring_buffer__reserve`/`submit`, returns errors such as `ENOSPC` without
 waiting, and preserves the 64-byte wire record. `NotifyComplete` and queue
 decrements use the scalar C wrappers. Decrements retain the existing
@@ -119,18 +121,26 @@ Go pointers. `BlockTilReadyForDequeue` remains a Go channel wait in this
 repository, which releases P normally. The producer's blocking libbpf ring
 polling remains standard Cgo, as do initialization, BPF map updates, ring
 allocation/free, and other potentially blocking calls. Normal Go safe points
-between fast calls allow GC/STW progress; an unexpectedly blocking C wrapper
-or BPF program would delay STW while holding P.
+between fast calls allow GC/STW progress; an unexpectedly blocking wrapper
+passed to `Call` would delay STW while holding P.
 
-`BPF_PROG_TYPE_SYSCALL` is kernel-marked sleepable. This optimization relies on
-the current `rs_select_cpu` doing bounded work without sleeping helpers;
-kernel faults or reclaim can still delay the syscall and STW. Do not add
-sleeping helpers or unbounded work to this program. This is not a hard
+`BPF_PROG_TYPE_SYSCALL` is kernel-marked sleepable. Even bounded BPF work does
+not make the surrounding syscall non-blocking: kernel faults or reclaim can
+delay it. Do not restrict the scheduler process to `GOMAXPROCS=1`: CPU
+selection holds P, and other goroutines, including the ring-buffer producer,
+need to make progress. Multiple Ps do not eliminate GC/STW delays if the
+syscall blocks. Do not add unbounded work to this program. This is not a hard
 real-time or absolute STW-latency guarantee. Plugin overrides of `SelectCPU`
 retain their own execution behavior. Existing single-skeleton lifetime and
 rodata-before-load requirements still apply.
 
-`runtime.asmcgocall` is an unsupported Go runtime API. Go 1.23+ requires
+For wrappers that may block, `schedbridge.CallSyscall` is an alternative
+that calls `runtime.cgocall` with the same single-pointer ABI. It still uses
+`asmcgocall` internally, but includes syscall, GC, signal, and Cgo bookkeeping
+so the runtime can reclaim P. CPU selection does not currently use this
+alternative; dispatch and counters also remain on the direct path.
+
+The bridge relies on internal Go runtime APIs. Go 1.23+ requires
 `-ldflags="-checklinkname=0"` to link it; `make build` includes this flag.
 The supported scheduler targets are Linux amd64 and arm64; revalidate the ABI
 and runtime behavior when upgrading Go.
@@ -144,16 +154,32 @@ go test -ldflags="-checklinkname=0" ./internal/schedbridge \
 # Or: make bench
 ```
 
-The benchmark compares the same scalar C load through standard Cgo and through
+The load benchmark compares the same scalar C load through standard Cgo and through
 the single-pointer wrapper/`asmcgocall` path, including argument/result
 marshalling; `GoAtomic` measures the counter-read path. Compare `ns/op` and
 allocations on the deployment hardware; this measures call overhead, not
 end-to-end scheduler latency.
 
+`BenchmarkSyscall` compares a `getpid` syscall via generated Cgo and via
+`CallSyscall`, both with runtime bookkeeping. The regression tests also block
+in a C read with `GOMAXPROCS=1` and verify timer/GC progress and thread pinning.
+
 With the build prerequisites installed, `make test-hotpath` builds the scheduler
 and runs ABI, counter, dispatch/error, GC, and thread-pinning tests. Kernel-backed
 tests for CPU selection and ring exhaustion skip when BPF permissions or kernel
 support are unavailable; they do not attach the scheduler.
+
+To compare CPU-selection call overhead on a BPF-capable host, use the same
+`CGO_CFLAGS` and `CGO_LDFLAGS` as `make test-hotpath` and run:
+
+```bash
+go test -ldflags="-checklinkname=0" ./goland_core \
+  -run='^$' -bench=BenchmarkSelectCPU -benchmem -count=5
+```
+
+This benchmark runs a small syscall BPF program through both `Program.Run`
+and the direct `asmcgocall` bridge; it does not attach a scheduler or measure
+production workload tail latency.
 
 ### Testing the Scheduler
 
